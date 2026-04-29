@@ -99,6 +99,9 @@ pub use remote_mode::RemoteModeCmd;
 pub mod rm;
 pub use rm::RmCmd;
 
+pub mod root;
+pub use root::RootCmd;
+
 pub mod save;
 pub use save::SaveCmd;
 
