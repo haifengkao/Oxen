@@ -89,6 +89,7 @@ async fn async_main() -> ExitCode {
         Box::new(cmd::RestoreCmd),
         Box::new(cmd::RemoteCmd),
         Box::new(cmd::RmCmd),
+        Box::new(cmd::RootCmd),
         Box::new(cmd::SaveCmd),
         Box::new(cmd::SchemasCmd),
         Box::new(cmd::ShowCmd),
