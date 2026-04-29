@@ -11,6 +11,8 @@ use liboxen::core::df::tabular;
 use liboxen::error::OxenError;
 use liboxen::model::diff::tabular_diff::TabularDiffMods;
 use liboxen::model::diff::{ChangeType, DiffResult, TextDiff};
+use liboxen::model::staged_data::StagedDataOpts;
+use liboxen::model::{LocalRepository, StagedData, StagedEntryStatus};
 use liboxen::opts::DiffOpts;
 use liboxen::repositories;
 
@@ -78,12 +80,53 @@ impl RunCmd for DiffCmd {
                     .help("Output directory path to write the results")
                     .action(clap::ArgAction::Set),
             )
+            .arg(
+                Arg::new("name_status")
+                    .long("name-status")
+                    .help("Show only changed entry names and statuses.")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("json")
+                    .long("json")
+                    .help("Print machine-readable JSON. Currently supported with --name-status.")
+                    .action(clap::ArgAction::SetTrue),
+            )
     }
 
     async fn run(&self, args: &clap::ArgMatches) -> Result<(), OxenError> {
         // Parse Args
         let opts = DiffCmd::parse_args(args);
         let output = opts.output.clone();
+
+        if args.get_flag("json") && !args.get_flag("name_status") {
+            return Err(OxenError::basic_str(
+                "`oxen diff --json` currently requires `--name-status`.",
+            ));
+        }
+
+        if args.get_flag("name_status") {
+            if args.get_many::<String>("commits_or_files").is_some() {
+                return Err(OxenError::basic_str(
+                    "`oxen diff --name-status` currently supports working tree changes only.",
+                ));
+            }
+
+            let repo = LocalRepository::from_current_dir()?;
+            let path = status_path_for_name_status(&repo, &opts.path_1);
+            let status_opts = StagedDataOpts::from_paths(&[path]);
+            let status = repositories::status::status_from_opts(&repo, &status_opts)?;
+
+            if args.get_flag("json") {
+                println!(
+                    "{}",
+                    serde_json::to_string(&name_status_json_value(&status))?
+                );
+            } else {
+                print_name_status(&status);
+            }
+            return Ok(());
+        }
 
         let mut diff_result = repositories::diffs::diff(opts).await?;
 
@@ -92,6 +135,121 @@ impl RunCmd for DiffCmd {
 
         Ok(())
     }
+}
+
+fn status_path_for_name_status(repo: &LocalRepository, path: &PathBuf) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        return repo.path.clone();
+    }
+    if path.is_absolute() {
+        return path.clone();
+    }
+    repo.path.join(path)
+}
+
+fn name_status_json_value(status: &StagedData) -> serde_json::Value {
+    serde_json::json!({
+        "entries": name_status_entries(status),
+    })
+}
+
+fn name_status_entries(status: &StagedData) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+
+    let mut staged_files: Vec<_> = status.staged_files.iter().collect();
+    staged_files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (path, entry) in staged_files {
+        entries.push(name_status_entry_json(
+            path,
+            staged_entry_status_str(&entry.status),
+            false,
+            "staged",
+        ));
+    }
+
+    for (path, staged_dirs) in status.staged_dirs.paths.iter() {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        for staged_dir in staged_dirs {
+            entries.push(name_status_entry_json(
+                &staged_dir.path,
+                staged_entry_status_str(&staged_dir.status),
+                true,
+                "staged",
+            ));
+        }
+    }
+
+    let mut modified_files: Vec<_> = status.modified_files.iter().collect();
+    modified_files.sort();
+    for path in modified_files {
+        entries.push(name_status_entry_json(path, "modified", false, "working"));
+    }
+
+    let mut moved_files = status.moved_files.clone();
+    moved_files.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
+    for (path, _, _) in moved_files {
+        entries.push(name_status_entry_json(&path, "moved", false, "working"));
+    }
+
+    let mut untracked_files = status.untracked_files.clone();
+    untracked_files.sort();
+    for path in untracked_files {
+        entries.push(name_status_entry_json(&path, "untracked", false, "working"));
+    }
+
+    let mut untracked_dirs = status.untracked_dirs.clone();
+    untracked_dirs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (path, _) in untracked_dirs {
+        entries.push(name_status_entry_json(&path, "untracked", true, "working"));
+    }
+
+    let mut removed_files: Vec<_> = status.removed_files.iter().collect();
+    removed_files.sort();
+    for path in removed_files {
+        entries.push(name_status_entry_json(path, "removed", false, "working"));
+    }
+
+    entries
+}
+
+fn name_status_entry_json(
+    path: &PathBuf,
+    status: &str,
+    is_directory: bool,
+    area: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path": path_to_string(path),
+        "status": status,
+        "is_directory": is_directory,
+        "area": area,
+    })
+}
+
+fn print_name_status(status: &StagedData) {
+    for entry in name_status_entries(status) {
+        let area = entry["area"].as_str().unwrap_or("");
+        let status = entry["status"].as_str().unwrap_or("");
+        let path = entry["path"].as_str().unwrap_or("");
+        println!("{area}\t{status}\t{path}");
+    }
+}
+
+fn staged_entry_status_str(status: &StagedEntryStatus) -> &'static str {
+    match status {
+        StagedEntryStatus::Added => "added",
+        StagedEntryStatus::Modified => "modified",
+        StagedEntryStatus::Removed => "removed",
+        StagedEntryStatus::Unmodified => "unmodified",
+    }
+}
+
+fn path_to_string(path: &PathBuf) -> String {
+    path.to_str()
+        .expect("Oxen diff paths must be valid UTF-8")
+        .to_string()
 }
 
 impl DiffCmd {
@@ -350,5 +508,64 @@ impl DiffCmd {
         // Save to disk if we have an output
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liboxen::model::{StagedData, StagedEntry, StagedEntryStatus};
+
+    #[test]
+    fn name_status_json_groups_staged_and_working_entries() {
+        let mut status = StagedData::empty();
+        status.staged_files.insert(
+            PathBuf::from("tracked.yml"),
+            StagedEntry::empty_status(StagedEntryStatus::Modified),
+        );
+        status.modified_files.insert(PathBuf::from("working.yml"));
+        status.untracked_files.push(PathBuf::from("new.json"));
+        status.untracked_dirs.push((PathBuf::from("assets"), 3));
+        status.removed_files.insert(PathBuf::from("old.har"));
+
+        let json = name_status_json_value(&status);
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "entries": [
+                    {
+                        "path": "tracked.yml",
+                        "status": "modified",
+                        "is_directory": false,
+                        "area": "staged"
+                    },
+                    {
+                        "path": "working.yml",
+                        "status": "modified",
+                        "is_directory": false,
+                        "area": "working"
+                    },
+                    {
+                        "path": "new.json",
+                        "status": "untracked",
+                        "is_directory": false,
+                        "area": "working"
+                    },
+                    {
+                        "path": "assets",
+                        "status": "untracked",
+                        "is_directory": true,
+                        "area": "working"
+                    },
+                    {
+                        "path": "old.har",
+                        "status": "removed",
+                        "is_directory": false,
+                        "area": "working"
+                    }
+                ]
+            })
+        );
     }
 }
