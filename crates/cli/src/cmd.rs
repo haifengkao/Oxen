@@ -105,6 +105,9 @@ pub use save::SaveCmd;
 pub mod schemas;
 pub use schemas::SchemasCmd;
 
+pub mod show;
+pub use show::ShowCmd;
+
 pub mod tree;
 pub use tree::TreeCmd;
 
