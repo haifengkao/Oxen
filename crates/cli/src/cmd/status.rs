@@ -3,11 +3,11 @@ use clap::{Arg, ArgMatches, Command};
 
 use glob::glob;
 use liboxen::error::OxenError;
-use liboxen::model::LocalRepository;
 use liboxen::model::staged_data::StagedDataOpts;
+use liboxen::model::{Branch, Commit, LocalRepository, StagedData, StagedEntryStatus};
 use liboxen::repositories;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::helpers::check_repo_migration_needed;
 
@@ -55,6 +55,12 @@ impl RunCmd for StatusCmd {
                     .action(clap::ArgAction::SetTrue),
             )
             .arg(
+                Arg::new("json")
+                    .long("json")
+                    .help("If present, prints repository status as machine-readable JSON.")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
                 Arg::new("paths")
                     .num_args(0..)
                     .trailing_var_arg(true)  // Collect all remaining args as paths
@@ -94,13 +100,21 @@ impl RunCmd for StatusCmd {
         log::debug!("status opts: {opts:?}");
 
         let repo_status = repositories::status::status_from_opts(&repository, &opts).await?;
+        let current_branch = repositories::branches::current_branch(&repository)?;
+        let head = repositories::commits::head_commit_maybe(&repository)?;
 
-        if let Some(current_branch) = repositories::branches::current_branch(&repository)? {
+        if args.get_flag("json") {
+            let json = status_json_value(&repo_status, current_branch.as_ref(), head.as_ref());
+            println!("{}", serde_json::to_string(&json)?);
+            return Ok(());
+        }
+
+        if let Some(current_branch) = current_branch {
             println!(
                 "On branch {} -> {}\n",
                 current_branch.name, current_branch.commit_id
             );
-        } else if let Some(head) = repositories::commits::head_commit_maybe(&repository)? {
+        } else if let Some(head) = head {
             println!(
                 "You are in 'detached HEAD' state.\nHEAD is now at {} {}\n",
                 head.id, head.message
@@ -111,6 +125,120 @@ impl RunCmd for StatusCmd {
 
         Ok(())
     }
+}
+
+fn status_json_value(
+    repo_status: &StagedData,
+    current_branch: Option<&Branch>,
+    head: Option<&Commit>,
+) -> serde_json::Value {
+    let mut staged = Vec::new();
+    let mut working = Vec::new();
+
+    for (path, staged_dirs) in repo_status.staged_dirs.paths.iter() {
+        if path == Path::new("") {
+            continue;
+        }
+        for staged_dir in staged_dirs {
+            staged.push(status_entry_json(
+                &staged_dir.path,
+                staged_entry_status_str(&staged_dir.status),
+                true,
+                Some(staged_dir.num_files_staged),
+            ));
+        }
+    }
+
+    let mut staged_files: Vec<_> = repo_status.staged_files.iter().collect();
+    staged_files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (path, entry) in staged_files {
+        staged.push(status_entry_json(
+            path,
+            staged_entry_status_str(&entry.status),
+            false,
+            None,
+        ));
+    }
+
+    let mut modified_files: Vec<_> = repo_status.modified_files.iter().collect();
+    modified_files.sort();
+    for path in modified_files {
+        working.push(status_entry_json(path, "modified", false, None));
+    }
+
+    let mut moved_files = repo_status.moved_files.clone();
+    moved_files.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
+    for (path, removed_path, _) in moved_files {
+        let mut value = status_entry_json(&path, "moved", false, None);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "from_path".to_string(),
+                serde_json::Value::String(path_to_string(&removed_path)),
+            );
+        }
+        working.push(value);
+    }
+
+    let mut untracked_files = repo_status.untracked_files.clone();
+    untracked_files.sort();
+    for path in untracked_files {
+        working.push(status_entry_json(&path, "untracked", false, None));
+    }
+
+    let mut untracked_dirs = repo_status.untracked_dirs.clone();
+    untracked_dirs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (path, num_files) in untracked_dirs {
+        working.push(status_entry_json(&path, "untracked", true, Some(num_files)));
+    }
+
+    let mut removed_files: Vec<_> = repo_status.removed_files.iter().collect();
+    removed_files.sort();
+    for path in removed_files {
+        working.push(status_entry_json(path, "removed", false, None));
+    }
+
+    serde_json::json!({
+        "branch": current_branch.map(|branch| serde_json::json!({
+            "name": branch.name,
+            "commit_id": branch.commit_id,
+        })),
+        "head": head.map(|commit| serde_json::json!({
+            "commit_id": commit.id,
+            "message": commit.message,
+        })),
+        "is_clean": repo_status.is_clean(),
+        "staged": staged,
+        "working": working,
+    })
+}
+
+fn status_entry_json(
+    path: &Path,
+    status: &str,
+    is_directory: bool,
+    num_files: Option<usize>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path": path_to_string(path),
+        "status": status,
+        "is_directory": is_directory,
+        "num_files": num_files,
+    })
+}
+
+fn staged_entry_status_str(status: &StagedEntryStatus) -> &'static str {
+    match status {
+        StagedEntryStatus::Added => "added",
+        StagedEntryStatus::Modified => "modified",
+        StagedEntryStatus::Removed => "removed",
+        StagedEntryStatus::Unmodified => "unmodified",
+    }
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_str()
+        .expect("Oxen status paths must be valid UTF-8")
+        .to_string()
 }
 
 fn parse_ignore_files(paths: Option<&String>) -> Option<HashSet<PathBuf>> {
@@ -128,5 +256,70 @@ fn parse_ignore_files(paths: Option<&String>) -> Option<HashSet<PathBuf>> {
             log::error!("Err: {err:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liboxen::model::{StagedData, StagedEntry, StagedEntryStatus};
+    use std::path::PathBuf;
+
+    #[test]
+    fn status_json_groups_staged_and_working_entries() {
+        let mut status = StagedData::empty();
+        status.staged_files.insert(
+            PathBuf::from("tracked.yml"),
+            StagedEntry::empty_status(StagedEntryStatus::Modified),
+        );
+        status.modified_files.insert(PathBuf::from("working.yml"));
+        status.untracked_files.push(PathBuf::from("new.json"));
+        status.untracked_dirs.push((PathBuf::from("assets"), 3));
+        status.removed_files.insert(PathBuf::from("old.har"));
+
+        let json = status_json_value(&status, None, None);
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "branch": null,
+                "head": null,
+                "is_clean": false,
+                "staged": [
+                    {
+                        "path": "tracked.yml",
+                        "status": "modified",
+                        "is_directory": false,
+                        "num_files": null
+                    }
+                ],
+                "working": [
+                    {
+                        "path": "working.yml",
+                        "status": "modified",
+                        "is_directory": false,
+                        "num_files": null
+                    },
+                    {
+                        "path": "new.json",
+                        "status": "untracked",
+                        "is_directory": false,
+                        "num_files": null
+                    },
+                    {
+                        "path": "assets",
+                        "status": "untracked",
+                        "is_directory": true,
+                        "num_files": 3
+                    },
+                    {
+                        "path": "old.har",
+                        "status": "removed",
+                        "is_directory": false,
+                        "num_files": null
+                    }
+                ]
+            })
+        );
     }
 }
