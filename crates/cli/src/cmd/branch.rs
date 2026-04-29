@@ -4,7 +4,7 @@ use colored::Colorize;
 
 use liboxen::api;
 use liboxen::error::OxenError;
-use liboxen::model::LocalRepository;
+use liboxen::model::{Branch, LocalRepository};
 use liboxen::repositories;
 
 use crate::cmd::RunCmd;
@@ -83,6 +83,12 @@ impl RunCmd for BranchCmd {
                     .exclusive(true)
                     .action(clap::ArgAction::SetTrue),
             )
+            .arg(
+                Arg::new("json")
+                    .long("json")
+                    .help("Print local branches as machine-readable JSON.")
+                    .action(clap::ArgAction::SetTrue),
+            )
     }
 
     async fn run(&self, args: &clap::ArgMatches) -> Result<(), OxenError> {
@@ -92,6 +98,8 @@ impl RunCmd for BranchCmd {
         // Parse Args
         if let Some((cmd, _)) = args.subcommand() {
             Err(OxenError::unknown_subcommand("branch", cmd))
+        } else if args.get_flag("json") {
+            self.list_branches_json(&repo)
         } else if args.get_flag("all") {
             self.list_all_branches(&repo).await
         } else if let Some(remote_name) = args.get_one::<String>("remote") {
@@ -129,7 +137,85 @@ impl RunCmd for BranchCmd {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liboxen::model::Branch;
+
+    #[test]
+    fn branch_json_marks_current_branch() {
+        let main = Branch {
+            name: "main".to_string(),
+            commit_id: "abc123".to_string(),
+        };
+        let dev = Branch {
+            name: "dev".to_string(),
+            commit_id: "def456".to_string(),
+        };
+
+        let json = branch_json_value(&[dev.clone(), main.clone()], Some(&main));
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "current": {
+                    "name": "main",
+                    "commit_id": "abc123"
+                },
+                "branches": [
+                    {
+                        "name": "dev",
+                        "commit_id": "def456",
+                        "is_current": false
+                    },
+                    {
+                        "name": "main",
+                        "commit_id": "abc123",
+                        "is_current": true
+                    }
+                ]
+            })
+        );
+    }
+}
+
+fn branch_json_value(branches: &[Branch], current_branch: Option<&Branch>) -> serde_json::Value {
+    let mut branches = branches.to_vec();
+    branches.sort_by(|a, b| a.name.cmp(&b.name));
+    let branches: Vec<serde_json::Value> = branches
+        .iter()
+        .map(|branch| {
+            let is_current = current_branch
+                .map(|current| current.name == branch.name)
+                .unwrap_or(false);
+            serde_json::json!({
+                "name": branch.name,
+                "commit_id": branch.commit_id,
+                "is_current": is_current,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "current": current_branch.map(|branch| serde_json::json!({
+            "name": branch.name,
+            "commit_id": branch.commit_id,
+        })),
+        "branches": branches,
+    })
+}
+
 impl BranchCmd {
+    pub fn list_branches_json(&self, repo: &LocalRepository) -> Result<(), OxenError> {
+        let branches = repositories::branches::list(repo)?;
+        let current_branch = repositories::branches::current_branch(repo)?;
+        println!(
+            "{}",
+            serde_json::to_string(&branch_json_value(&branches, current_branch.as_ref()))?
+        );
+        Ok(())
+    }
+
     pub async fn list_all_branches(&self, repo: &LocalRepository) -> Result<(), OxenError> {
         self.list_branches(repo)?;
 
