@@ -64,6 +64,40 @@ pub fn list(repo: &LocalRepository) -> Result<Vec<OfflineEntry>, OxenError> {
     Ok(load_index(repo)?.files.into_values().collect())
 }
 
+pub fn clear_restored_paths<'a, I>(
+    repo: &LocalRepository,
+    paths: I,
+) -> Result<Vec<OfflineEntry>, OxenError>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    let normalized_paths = paths
+        .into_iter()
+        .map(|path| normalize_repo_path(repo, path))
+        .collect::<Result<Vec<_>, OxenError>>()?;
+    let mut index = load_index(repo)?;
+    let mut cleared = Vec::new();
+
+    index.files.retain(|_, entry| {
+        let matches_path = normalized_paths
+            .iter()
+            .any(|path| entry.path == *path || entry.path.starts_with(path));
+        let restored = repo.path.join(&entry.path).exists();
+        if matches_path && restored {
+            cleared.push(entry.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    if !cleared.is_empty() {
+        save_index(repo, &index)?;
+    }
+
+    Ok(cleared)
+}
+
 pub async fn drop_paths(
     repo: &LocalRepository,
     paths: &[PathBuf],
@@ -279,6 +313,7 @@ fn collect_files_from_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opts::RestoreOpts;
     use crate::{repositories, test, util};
     use std::path::PathBuf;
 
@@ -348,6 +383,29 @@ mod tests {
             assert!(!first.exists());
             assert!(!second.exists());
             assert!(repositories::status(&repo)?.is_clean());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn restore_clears_offline_marker() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let relative_path = PathBuf::from("hello.txt");
+            let file_path = repo.path.join(&relative_path);
+            util::fs::write_to_path(&file_path, "hello offline")?;
+            repositories::add(&repo, &file_path).await?;
+            repositories::commit(&repo, "add hello")?;
+
+            drop_paths(&repo, std::slice::from_ref(&relative_path)).await?;
+            assert!(!file_path.exists());
+            assert_eq!(list(&repo)?.len(), 1);
+
+            repositories::restore::restore(&repo, RestoreOpts::from_path(&relative_path)).await?;
+
+            assert_eq!(util::fs::read_from_path(&file_path)?, "hello offline");
+            assert!(list(&repo)?.is_empty());
 
             Ok(())
         })

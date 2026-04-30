@@ -2,6 +2,7 @@ use crate::core::v_latest::index;
 use crate::error::OxenError;
 use crate::model::LocalRepository;
 use crate::opts::{GlobOpts, RestoreOpts};
+use crate::repositories;
 use crate::util;
 
 // TODO: Deprecate this module
@@ -21,8 +22,13 @@ pub async fn restore(repo: &LocalRepository, restore_opts: RestoreOpts) -> Resul
 
     let mut restore_opts = restore_opts.clone();
     restore_opts.paths = expanded_paths;
+    let restored_paths = restore_opts.paths.clone();
+    let restore_staged = restore_opts.staged;
 
     index::restore::restore(repo, restore_opts).await?;
+    if !restore_staged {
+        repositories::offline::clear_restored_paths(repo, &restored_paths)?;
+    }
 
     Ok(())
 }
