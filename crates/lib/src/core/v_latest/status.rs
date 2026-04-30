@@ -27,6 +27,7 @@ use std::time::Duration;
 use crate::core::v_latest::index::CommitMerkleTree;
 use crate::model::merkle_tree::node::EMerkleTreeNode;
 use crate::model::merkle_tree::node::MerkleTreeNode;
+use crate::repositories::offline::OfflineIndex;
 
 pub fn status(repo: &LocalRepository) -> Result<StagedData, OxenError> {
     status_from_dir(repo, &repo.path)
@@ -51,6 +52,7 @@ pub fn status_from_opts(
     let staged_db_maybe = open_staged_db(repo)?;
     let head_commit = repositories::commits::head_commit_maybe(repo)?;
     let dir_hashes = get_dir_hashes(repo, &head_commit)?;
+    let offline_index = repositories::offline::load_index(repo)?;
 
     let read_progress = ProgressBar::new_spinner();
     read_progress.set_style(ProgressStyle::default_spinner());
@@ -70,6 +72,7 @@ pub fn status_from_opts(
             &relative_dir,
             &staged_db_maybe,
             &dir_hashes,
+            &offline_index,
             &read_progress,
             &mut total_entries,
         )?;
@@ -124,6 +127,7 @@ pub fn status_from_opts_and_staged_data(
     //log::debug!("status_from_opts {:?}", opts.paths);
     let head_commit = repositories::commits::head_commit_maybe(repo)?;
     let dir_hashes = get_dir_hashes(repo, &head_commit)?;
+    let offline_index = repositories::offline::load_index(repo)?;
 
     let read_progress = ProgressBar::new_spinner();
     read_progress.set_style(ProgressStyle::default_spinner());
@@ -144,6 +148,7 @@ pub fn status_from_opts_and_staged_data(
             &relative_dir,
             staged_data,
             &dir_hashes,
+            &offline_index,
             &read_progress,
             &mut total_entries,
         )?;
@@ -448,6 +453,7 @@ fn find_changes(
     search_node_path: impl AsRef<Path>,
     staged_db: &Option<DBWithThreadMode<SingleThreaded>>,
     dir_hashes: &HashMap<PathBuf, MerkleHash>,
+    offline_index: &OfflineIndex,
     progress: &ProgressBar,
     total_entries: &mut usize,
 ) -> Result<(UntrackedData, HashSet<PathBuf>, HashSet<PathBuf>), OxenError> {
@@ -525,6 +531,7 @@ fn find_changes(
                 &relative_path,
                 staged_db,
                 dir_hashes,
+                offline_index,
                 progress,
                 total_entries,
             )?;
@@ -599,8 +606,14 @@ fn find_changes(
                     for child in repositories::tree::list_files_and_folders(&node)? {
                         if let EMerkleTreeNode::File(file_node) = &child.node {
                             let file_path = full_path.join(file_node.name());
-                            if !file_path.exists() {
-                                removed.insert(search_node_path.join(file_node.name()));
+                            let relative_file_path = search_node_path.join(file_node.name());
+                            if !file_path.exists()
+                                && !offline_index.is_current(
+                                    &relative_file_path,
+                                    &file_node.hash().to_string(),
+                                )?
+                            {
+                                removed.insert(relative_file_path);
                             }
                         }
                     }
@@ -614,8 +627,12 @@ fn find_changes(
             for child in repositories::tree::list_files_and_folders(&node)? {
                 if let EMerkleTreeNode::File(file_node) = &child.node {
                     let file_path = full_path.join(file_node.name());
-                    if !file_path.exists() {
-                        removed.insert(search_node_path.join(file_node.name()));
+                    let relative_file_path = search_node_path.join(file_node.name());
+                    if !file_path.exists()
+                        && !offline_index
+                            .is_current(&relative_file_path, &file_node.hash().to_string())?
+                    {
+                        removed.insert(relative_file_path);
                     }
                 } else if let EMerkleTreeNode::Directory(dir) = &child.node {
                     let dir_path = full_path.join(dir.name());
@@ -629,11 +646,14 @@ fn find_changes(
                             &relative_dir_path,
                             dir.hash(),
                             &gitignore,
+                            offline_index,
                             &mut count,
                         )?;
 
                         *total_entries += count;
-                        removed.insert(relative_dir_path);
+                        if count > 0 {
+                            removed.insert(relative_dir_path);
+                        }
                     }
                 }
             }
@@ -649,6 +669,7 @@ fn find_local_changes(
     search_node_path: impl AsRef<Path>,
     staged_data: &StagedData,
     dir_hashes: &HashMap<PathBuf, MerkleHash>,
+    offline_index: &OfflineIndex,
     progress: &ProgressBar,
     total_entries: &mut usize,
 ) -> Result<
@@ -735,6 +756,7 @@ fn find_local_changes(
                 &relative_path,
                 staged_data,
                 dir_hashes,
+                offline_index,
                 progress,
                 total_entries,
             )?;
@@ -849,6 +871,7 @@ fn find_local_changes(
                             &relative_dir_path,
                             dir.hash(),
                             &gitignore,
+                            offline_index,
                             &mut count,
                         )?;
 
@@ -869,6 +892,7 @@ fn count_removed_entries(
     relative_path: &Path,
     dir_hash: &MerkleHash,
     gitignore: &Option<Gitignore>,
+    offline_index: &OfflineIndex,
     removed_entries: &mut usize,
 ) -> Result<(), OxenError> {
     if oxenignore::is_ignored(relative_path, gitignore, true) {
@@ -878,9 +902,12 @@ fn count_removed_entries(
     let dir_node = CommitMerkleTree::read_depth(repo, dir_hash, 1)?;
     if let Some(ref node) = dir_node {
         for child in repositories::tree::list_files_and_folders(node)? {
-            if let EMerkleTreeNode::File(_) = &child.node {
+            if let EMerkleTreeNode::File(file_node) = &child.node {
                 // Any files nodes accessed here are children of a removed dir, so they must also be removed
-                *removed_entries += 1;
+                let relative_file_path = relative_path.join(file_node.name());
+                if !offline_index.is_current(&relative_file_path, &file_node.hash().to_string())? {
+                    *removed_entries += 1;
+                }
             } else if let EMerkleTreeNode::Directory(dir) = child.node {
                 let relative_dir_path = relative_path.join(dir.name());
                 count_removed_entries(
@@ -888,6 +915,7 @@ fn count_removed_entries(
                     &relative_dir_path,
                     dir.hash(),
                     gitignore,
+                    offline_index,
                     removed_entries,
                 )?;
             }
