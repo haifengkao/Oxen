@@ -4580,6 +4580,7 @@ dependencies = [
  "walkdir",
  "xxhash-rust",
  "zip 2.4.2",
+ "zstd",
 ]
 
 [[package]]
