@@ -20,6 +20,10 @@ use tokio_util::io::StreamReader;
 
 use super::version_store::{LocalFilePath, VersionStore};
 use crate::constants::VERSION_FILE_NAME;
+use crate::storage::version_encoding::{
+    VERSION_METADATA_FILE_NAME, VersionEncodingMetadata, decode_from_storage, encode_for_storage,
+    should_buffer_for_compression,
+};
 use crate::util::hasher;
 use crate::view::versions::CleanCorruptedVersionsResult;
 use xxhash_rust::xxh3::Xxh3;
@@ -115,6 +119,10 @@ impl S3VersionStore {
         format!("{}/{}", self.version_dir(hash), VERSION_FILE_NAME)
     }
 
+    fn metadata_key(&self, hash: &str) -> String {
+        format!("{}/{}", self.version_dir(hash), VERSION_METADATA_FILE_NAME)
+    }
+
     /// Get the S3 key for a chunk at a specific offset
     fn chunk_key(&self, hash: &str, offset: u64) -> String {
         format!("{}/chunks/{}", self.version_dir(hash), offset)
@@ -194,6 +202,110 @@ impl S3VersionStore {
 
         Ok(())
     }
+
+    async fn put_object_bytes(&self, key: String, data: Vec<u8>) -> Result<(), OxenError> {
+        let client = self.client().await?;
+        client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(data))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn store_encoded_version(&self, hash: &str, data: &[u8]) -> Result<(), OxenError> {
+        let encoded = encode_for_storage(hash, data)?;
+        self.put_object_bytes(self.generate_key(hash), encoded.bytes)
+            .await?;
+
+        if let Some(metadata) = encoded.metadata {
+            let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+            self.put_object_bytes(self.metadata_key(hash), metadata_bytes)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_version_metadata(
+        &self,
+        hash: &str,
+    ) -> Result<Option<VersionEncodingMetadata>, OxenError> {
+        let client = self.client().await?;
+        let key = self.metadata_key(hash);
+
+        match client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(SdkError::ServiceError(err)) => match err.err() {
+                HeadObjectError::NotFound(_) => return Ok(None),
+                err => {
+                    return Err(OxenError::basic_str(format!(
+                        "S3 metadata head_object failed: {err:?}"
+                    )));
+                }
+            },
+            Err(err) => {
+                return Err(OxenError::basic_str(format!(
+                    "S3 metadata head_object failed: {err:?}"
+                )));
+            }
+        }
+
+        let resp = client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| OxenError::basic_str(format!("S3 metadata get_object failed: {e}")))?;
+
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| OxenError::basic_str(format!("S3 metadata body read failed: {e}")))?
+            .into_bytes();
+
+        let metadata = serde_json::from_slice(&bytes)?;
+        Ok(Some(metadata))
+    }
+
+    async fn read_stored_version(&self, hash: &str) -> Result<Vec<u8>, OxenError> {
+        let client = self.client().await?;
+        let key = self.generate_key(hash);
+
+        let resp = client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| OxenError::basic_str(format!("S3 get_object failed: {e}")))?;
+
+        let data = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| OxenError::basic_str(format!("S3 read body failed: {e}")))?
+            .into_bytes()
+            .to_vec();
+
+        Ok(data)
+    }
+
+    async fn read_decoded_version(&self, hash: &str) -> Result<Vec<u8>, OxenError> {
+        let metadata = self.read_version_metadata(hash).await?;
+        let data = self.read_stored_version(hash).await?;
+        decode_from_storage(metadata.as_ref(), &data)
+    }
 }
 
 #[async_trait]
@@ -269,6 +381,21 @@ impl VersionStore for S3VersionStore {
 
         let mut reader = tokio::io::BufReader::new(reader);
 
+        if should_buffer_for_compression(size) {
+            let mut buf = Vec::with_capacity(size as usize);
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+                .await
+                .map_err(|e| OxenError::upload(&format!("Failed to read: {e}")))?;
+            let computed = hasher::hash_buffer(&buf);
+            if computed != hash {
+                return Err(OxenError::upload(&format!(
+                    "store_version_from_reader hash mismatch: expected {hash}, computed {computed}"
+                )));
+            }
+            self.store_encoded_version(hash, &buf).await?;
+            return Ok(());
+        }
+
         // Files at or below the oneshot threshold: single put_object. Hash the fully-read
         // buffer and verify before uploading so we never write corrupt or misnamed data to S3.
         if size <= self.oneshot_size {
@@ -282,13 +409,7 @@ impl VersionStore for S3VersionStore {
                     "store_version_from_reader hash mismatch: expected {hash}, computed {computed}"
                 )));
             }
-            client
-                .put_object() // AWS recommends switching to multipart uploads for > 100 MB
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(ByteStream::from(buf))
-                .send()
-                .await?;
+            self.put_object_bytes(key, buf).await?;
             return Ok(());
         }
 
@@ -413,21 +534,10 @@ impl VersionStore for S3VersionStore {
     }
 
     async fn store_version(&self, hash: &str, data: &[u8]) -> Result<(), OxenError> {
-        let client = self.client().await?;
         log::debug!("Storing version to S3");
-        let key = self.generate_key(hash);
-
-        let body = ByteStream::from(data.to_vec());
-        client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body)
-            .send()
+        self.store_encoded_version(hash, data)
             .await
-            .map_err(|_| OxenError::Basic("failed to store version in S3".into()))?;
-
-        Ok(())
+            .map_err(|_| OxenError::Basic("failed to store version in S3".into()))
     }
 
     async fn store_version_derived(
@@ -455,6 +565,10 @@ impl VersionStore for S3VersionStore {
     }
 
     async fn get_version_size(&self, hash: &str) -> Result<u64, OxenError> {
+        if let Some(metadata) = self.read_version_metadata(hash).await? {
+            return Ok(metadata.raw_size);
+        }
+
         let client = self.client().await?;
         let key = self.generate_key(hash);
 
@@ -474,26 +588,7 @@ impl VersionStore for S3VersionStore {
     }
 
     async fn get_version(&self, hash: &str) -> Result<Vec<u8>, OxenError> {
-        let client = self.client().await?;
-        let key = self.generate_key(hash);
-
-        let resp = client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| OxenError::basic_str(format!("S3 get_object failed: {e}")))?;
-
-        let data = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| OxenError::basic_str(format!("S3 read body failed: {e}")))?
-            .into_bytes()
-            .to_vec();
-
-        Ok(data)
+        self.read_decoded_version(hash).await
     }
 
     async fn get_version_derived_size(
@@ -524,6 +619,12 @@ impl VersionStore for S3VersionStore {
         hash: &str,
     ) -> Result<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>, OxenError>
     {
+        if self.read_version_metadata(hash).await?.is_some() {
+            let data = self.read_decoded_version(hash).await?;
+            let stream = tokio_stream::once(Ok(Bytes::from(data)));
+            return Ok(Box::new(stream) as Box<_>);
+        }
+
         let client = self.client().await?;
         let key = self.generate_key(hash);
 
@@ -654,6 +755,27 @@ impl VersionStore for S3VersionStore {
     ) -> Result<Vec<u8>, OxenError> {
         if size == 0 {
             return Ok(Vec::new());
+        }
+
+        if self.read_version_metadata(hash).await?.is_some() {
+            let data = self.read_decoded_version(hash).await?;
+            let file_len = data.len() as u64;
+
+            if offset >= file_len || offset + size > file_len {
+                return Err(OxenError::IO(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "beyond end of file",
+                )));
+            }
+
+            let read_len = std::cmp::min(size, file_len - offset);
+            if read_len > usize::MAX as u64 {
+                return Err(OxenError::basic_str("requested chunk too large"));
+            }
+
+            let start = offset as usize;
+            let end = start + read_len as usize;
+            return Ok(data[start..end].to_vec());
         }
 
         let client = self.client().await?;
@@ -1006,9 +1128,14 @@ impl Stream for ByteStreamAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::version_encoding::VERSION_METADATA_FILE_NAME;
     use crate::storage::version_store::VersionStore;
 
+    use futures::StreamExt;
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
     use std::net::SocketAddr;
+    use std::path::Path;
     use tokio::net::TcpListener;
 
     async fn setup() -> (
@@ -1072,6 +1199,71 @@ mod tests {
         Client::from_conf(config)
     }
 
+    fn repeated_json_bytes() -> Vec<u8> {
+        let mut data = Vec::new();
+        for i in 0..2048 {
+            data.extend_from_slice(
+                format!(
+                    "{{\"kind\":\"snapshot\",\"index\":{i},\"url\":\"https://example.com/page\",\"selector\":\"main article .card\"}}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        data
+    }
+
+    fn incompressible_bytes() -> Vec<u8> {
+        let mut data = vec![0; 64 * 1024];
+        StdRng::seed_from_u64(42).fill_bytes(&mut data);
+        data
+    }
+
+    async fn read_s3_object(store: &S3VersionStore, key: String) -> Vec<u8> {
+        let client = store.client().await.unwrap();
+        client
+            .get_object()
+            .bucket(&store.bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+            .to_vec()
+    }
+
+    async fn s3_object_exists(store: &S3VersionStore, key: String) -> bool {
+        let client = store.client().await.unwrap();
+        client
+            .head_object()
+            .bucket(&store.bucket)
+            .key(key)
+            .send()
+            .await
+            .is_ok()
+    }
+
+    async fn collect_version_stream(store: &S3VersionStore, hash: &str) -> Vec<u8> {
+        let mut stream = store.get_version_stream(hash).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        collected
+    }
+
+    fn version_metadata_key(store: &S3VersionStore, hash: &str) -> String {
+        format!("{}/{}", store.version_dir(hash), VERSION_METADATA_FILE_NAME)
+    }
+
+    fn assert_path_contains(path: impl AsRef<Path>, expected: &[u8]) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
     #[tokio::test]
     async fn test_store_and_get_small_version_from_reader() {
         let (store, _tmp, _server) = setup().await;
@@ -1086,6 +1278,110 @@ mod tests {
 
         let retrieved = store.get_version(&hash).await.unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    #[tokio::test]
+    async fn test_store_compressible_version_transparently_round_trips_raw_bytes() {
+        let (store, tmp, _server) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let stored = read_s3_object(&store, store.generate_key(&hash)).await;
+        assert!(s3_object_exists(&store, version_metadata_key(&store, &hash)).await);
+        assert!(
+            stored.len() < data.len(),
+            "stored object should be compressed below raw size"
+        );
+        assert!(stored != data);
+        assert_eq!(
+            store.get_version_size(&hash).await.unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+        assert_eq!(collect_version_stream(&store, &hash).await, data);
+
+        let copy_path = tmp.dir_path().join("copy.json");
+        store.copy_version_to_path(&hash, &copy_path).await.unwrap();
+        assert_path_contains(&copy_path, &data);
+
+        let local_path = store.get_version_path(&hash).await.unwrap();
+        assert_path_contains(local_path.as_ref(), &data);
+    }
+
+    #[tokio::test]
+    async fn test_store_compressible_version_from_reader_uploads_compressed_object() {
+        let (store, _tmp, _server) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        let cursor = std::io::Cursor::new(data.clone());
+        store
+            .store_version_from_reader(&hash, Box::new(cursor), data.len() as u64)
+            .await
+            .unwrap();
+
+        let stored = read_s3_object(&store, store.generate_key(&hash)).await;
+        assert!(s3_object_exists(&store, version_metadata_key(&store, &hash)).await);
+        assert!(stored.len() < data.len());
+        assert!(stored != data);
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_identity_version_without_metadata_still_reads_raw_bytes() {
+        let (store, tmp, _server) = setup().await;
+        let data = b"legacy raw data without metadata";
+        let hash = hasher::hash_buffer(data);
+        let client = store.client().await.unwrap();
+        client
+            .put_object()
+            .bucket(&store.bucket)
+            .key(store.generate_key(&hash))
+            .body(ByteStream::from(data.to_vec()))
+            .send()
+            .await
+            .unwrap();
+
+        assert!(!s3_object_exists(&store, version_metadata_key(&store, &hash)).await);
+        assert_eq!(
+            store.get_version_size(&hash).await.unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+        assert_eq!(collect_version_stream(&store, &hash).await, data);
+
+        let copy_path = tmp.dir_path().join("legacy-copy.txt");
+        store.copy_version_to_path(&hash, &copy_path).await.unwrap();
+        assert_path_contains(&copy_path, data);
+    }
+
+    #[tokio::test]
+    async fn test_incompressible_version_remains_identity_and_not_larger() {
+        let (store, _tmp, _server) = setup().await;
+        let data = incompressible_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let stored = read_s3_object(&store, store.generate_key(&hash)).await;
+        assert!(!s3_object_exists(&store, version_metadata_key(&store, &hash)).await);
+        assert!(stored.len() <= data.len());
+        assert_eq!(stored, data);
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_get_version_chunk_reads_raw_bytes_for_compressed_version() {
+        let (store, _tmp, _server) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let chunk = store.get_version_chunk(&hash, 32, 128).await.unwrap();
+        assert_eq!(chunk, data[32..160]);
     }
 
     #[tokio::test]
