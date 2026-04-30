@@ -64,7 +64,7 @@ pub fn encode_for_storage(hash: &str, raw: &[u8]) -> Result<EncodedVersion, Oxen
 }
 
 pub fn should_buffer_for_compression(size: u64) -> bool {
-    size <= MAX_COMPRESS_BYTES as u64
+    size >= MIN_COMPRESS_BYTES as u64 && size <= MAX_COMPRESS_BYTES as u64
 }
 
 pub async fn read_metadata(
