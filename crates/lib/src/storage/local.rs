@@ -1,14 +1,19 @@
 use std;
 use std::collections::HashMap;
-use std::io::{self, ErrorKind};
+use std::io::{self, Cursor, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use crate::constants::{VERSION_CHUNK_FILE_NAME, VERSION_CHUNKS_DIR, VERSION_FILE_NAME};
 use crate::error::OxenError;
+use crate::storage::version_encoding::{
+    VERSION_METADATA_FILE_NAME, VersionEncodingMetadata, decode_from_storage, encode_for_storage,
+    read_metadata, should_buffer_for_compression, write_metadata,
+};
 use crate::storage::version_store::{LocalFilePath, VersionStore};
 use crate::util::{self, concurrency, hasher};
 use crate::view::versions::CleanCorruptedVersionsResult;
 
+use async_tempfile::TempFile;
 use async_trait::async_trait;
 use bytes::Bytes;
 use log;
@@ -17,6 +22,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tokio::fs::{self, File, metadata};
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::sync::Semaphore;
 use tokio_stream::Stream;
@@ -52,6 +58,10 @@ impl LocalVersionStore {
         self.version_dir(hash).join(VERSION_FILE_NAME)
     }
 
+    fn version_metadata_path(&self, hash: &str) -> PathBuf {
+        self.version_dir(hash).join(VERSION_METADATA_FILE_NAME)
+    }
+
     /// Get the directory containing all the chunks for a version file
     fn version_chunks_dir(&self, hash: &str) -> PathBuf {
         self.version_dir(hash).join(VERSION_CHUNKS_DIR)
@@ -68,6 +78,28 @@ impl LocalVersionStore {
         self.version_chunk_dir(hash, offset)
             .join(VERSION_CHUNK_FILE_NAME)
     }
+
+    async fn read_version_metadata(
+        &self,
+        hash: &str,
+    ) -> Result<Option<VersionEncodingMetadata>, OxenError> {
+        read_metadata(self.version_metadata_path(hash)).await
+    }
+
+    async fn store_encoded_version(&self, hash: &str, data: &[u8]) -> Result<(), OxenError> {
+        let encoded = encode_for_storage(hash, data)?;
+        fs::write(self.version_path(hash), &encoded.bytes).await?;
+        if let Some(metadata) = encoded.metadata {
+            write_metadata(self.version_metadata_path(hash), &metadata).await?;
+        }
+        Ok(())
+    }
+
+    async fn read_decoded_version(&self, hash: &str) -> Result<Vec<u8>, OxenError> {
+        let metadata = self.read_version_metadata(hash).await?;
+        let data = fs::read(self.version_path(hash)).await?;
+        decode_from_storage(metadata.as_ref(), &data)
+    }
 }
 
 #[async_trait]
@@ -83,7 +115,7 @@ impl VersionStore for LocalVersionStore {
         &self,
         hash: &str,
         mut reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        _size: u64,
+        size: u64,
     ) -> Result<(), OxenError> {
         let version_dir = self.version_dir(hash);
         fs::create_dir_all(&version_dir).await?;
@@ -91,8 +123,14 @@ impl VersionStore for LocalVersionStore {
         let version_path = self.version_path(hash);
 
         if !version_path.exists() {
-            let mut file = File::create(&version_path).await?;
-            tokio::io::copy(&mut *reader, &mut file).await?;
+            if should_buffer_for_compression(size) {
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data).await?;
+                self.store_encoded_version(hash, &data).await?;
+            } else {
+                let mut file = File::create(&version_path).await?;
+                tokio::io::copy(&mut *reader, &mut file).await?;
+            }
         }
 
         Ok(())
@@ -105,7 +143,7 @@ impl VersionStore for LocalVersionStore {
         let version_path = self.version_path(hash);
 
         if !version_path.exists() {
-            fs::write(&version_path, data).await?;
+            self.store_encoded_version(hash, data).await?;
         }
 
         Ok(())
@@ -127,15 +165,17 @@ impl VersionStore for LocalVersionStore {
     }
 
     async fn get_version_size(&self, hash: &str) -> Result<u64, OxenError> {
+        if let Some(metadata) = self.read_version_metadata(hash).await? {
+            return Ok(metadata.raw_size);
+        }
+
         let path = self.version_path(hash);
         let metadata = fs::metadata(&path).await?;
         Ok(metadata.len())
     }
 
     async fn get_version(&self, hash: &str) -> Result<Vec<u8>, OxenError> {
-        let path = self.version_path(hash);
-        let data = fs::read(&path).await?;
-        Ok(data)
+        self.read_decoded_version(hash).await
     }
 
     async fn get_version_derived_size(
@@ -153,6 +193,13 @@ impl VersionStore for LocalVersionStore {
         hash: &str,
     ) -> Result<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>, OxenError>
     {
+        if self.read_version_metadata(hash).await?.is_some() {
+            let data = self.read_decoded_version(hash).await?;
+            let reader = BufReader::new(Cursor::new(data));
+            let stream = ReaderStream::new(reader);
+            return Ok(Box::new(stream));
+        }
+
         let path = self.version_path(hash);
         let file = File::open(&path).await?;
         let reader = BufReader::new(file);
@@ -191,11 +238,31 @@ impl VersionStore for LocalVersionStore {
     }
 
     async fn get_version_path(&self, hash: &str) -> Result<LocalFilePath, OxenError> {
+        if self.read_version_metadata(hash).await?.is_some() {
+            let data = self.read_decoded_version(hash).await?;
+            let mut tmp = TempFile::new()
+                .await
+                .map_err(|e| OxenError::basic_str(format!("Failed to create temp file: {e}")))?;
+            tmp.write_all(&data)
+                .await
+                .map_err(|e| OxenError::basic_str(format!("Failed to write temp file: {e}")))?;
+            return Ok(LocalFilePath::Temp(tmp));
+        }
+
         Ok(LocalFilePath::Stable(self.version_path(hash)))
     }
 
     // TODO: (CleanCut) Do we need to make sure the destination path is outside the version store?
     async fn copy_version_to_path(&self, hash: &str, dest_path: &Path) -> Result<(), OxenError> {
+        if self.read_version_metadata(hash).await?.is_some() {
+            let data = self.read_decoded_version(hash).await?;
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(dest_path, data).await?;
+            return Ok(());
+        }
+
         let version_path = self.version_path(hash);
         log::debug!("copying version path: {version_path:?} to {dest_path:?}");
         util::fs::copy_mkdir(&version_path, dest_path).await?;
@@ -273,6 +340,27 @@ impl VersionStore for LocalVersionStore {
         offset: u64,
         size: u64,
     ) -> Result<Vec<u8>, OxenError> {
+        if self.read_version_metadata(hash).await?.is_some() {
+            let data = self.read_decoded_version(hash).await?;
+            let file_len = data.len() as u64;
+
+            if offset >= file_len || offset + size > file_len {
+                return Err(OxenError::IO(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "beyond end of file",
+                )));
+            }
+
+            let read_len = std::cmp::min(size, file_len - offset);
+            if read_len > usize::MAX as u64 {
+                return Err(OxenError::basic_str("requested chunk too large"));
+            }
+
+            let start = offset as usize;
+            let end = start + read_len as usize;
+            return Ok(data[start..end].to_vec());
+        }
+
         let version_file_path = self.version_path(hash);
 
         let mut file = File::open(&version_file_path).await?;
@@ -452,12 +540,48 @@ impl VersionStore for LocalVersionStore {
 
                     {
                         // First read the data async
-                        let data_path = suffix_path.join("data");
+                        let data_path = suffix_path.join(VERSION_FILE_NAME);
                         let data = match fs::read(&data_path).await {
                             Ok(b) => b,
                             Err(_) => {
                                 // cannot read data - treat as corrupted
                                 stats_cl.incr_io_error();
+
+                                if !dry_run && fs::remove_dir_all(&suffix_path).await.is_ok() {
+                                    stats_cl.incr_deleted();
+                                }
+                                drop(permit);
+                                continue;
+                            }
+                        };
+
+                        let metadata = match read_metadata(
+                            suffix_path.join(VERSION_METADATA_FILE_NAME),
+                        )
+                        .await
+                        {
+                            Ok(metadata) => metadata,
+                            Err(err) => {
+                                log::debug!(
+                                    "Failed to read version metadata for {expected_hash}: {err:?}"
+                                );
+                                stats_cl.incr_corrupted();
+
+                                if !dry_run && fs::remove_dir_all(&suffix_path).await.is_ok() {
+                                    stats_cl.incr_deleted();
+                                }
+                                drop(permit);
+                                continue;
+                            }
+                        };
+
+                        let data = match decode_from_storage(metadata.as_ref(), &data) {
+                            Ok(raw) => raw,
+                            Err(err) => {
+                                log::debug!(
+                                    "Failed to decode version file {expected_hash}: {err:?}"
+                                );
+                                stats_cl.incr_corrupted();
 
                                 if !dry_run && fs::remove_dir_all(&suffix_path).await.is_ok() {
                                     stats_cl.incr_deleted();
@@ -555,8 +679,15 @@ impl VersionStore for LocalVersionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::hasher;
+    use futures::StreamExt;
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
     use std::io::Cursor;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    const VERSION_METADATA_FILE_NAME: &str = "meta.json";
 
     async fn setup() -> (TempDir, LocalVersionStore) {
         let temp_dir = TempDir::new().unwrap();
@@ -613,6 +744,155 @@ mod tests {
         // Get and verify the data
         let retrieved = store.get_version(hash).await.unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    fn repeated_json_bytes() -> Vec<u8> {
+        let mut data = Vec::new();
+        for i in 0..2048 {
+            data.extend_from_slice(
+                format!(
+                    "{{\"kind\":\"snapshot\",\"index\":{i},\"url\":\"https://example.com/page\",\"selector\":\"main article .card\"}}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        data
+    }
+
+    fn incompressible_bytes() -> Vec<u8> {
+        let mut data = vec![0; 64 * 1024];
+        StdRng::seed_from_u64(42).fill_bytes(&mut data);
+        data
+    }
+
+    async fn collect_version_stream(store: &LocalVersionStore, hash: &str) -> Vec<u8> {
+        let mut stream = store.get_version_stream(hash).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        collected
+    }
+
+    fn version_metadata_path(store: &LocalVersionStore, hash: &str) -> std::path::PathBuf {
+        store.version_dir(hash).join(VERSION_METADATA_FILE_NAME)
+    }
+
+    fn assert_path_contains(path: impl AsRef<Path>, expected: &[u8]) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn test_store_compressible_version_transparently_round_trips_raw_bytes() {
+        let (_temp_dir, store) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let stored_path = store.version_path(&hash);
+        let stored_len = std::fs::metadata(&stored_path).unwrap().len();
+        assert!(version_metadata_path(&store, &hash).exists());
+        assert!(
+            stored_len < data.len() as u64,
+            "stored object should be compressed below raw size"
+        );
+        assert!(std::fs::read(&stored_path).unwrap() != data);
+        assert_eq!(
+            store.get_version_size(&hash).await.unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+        assert_eq!(collect_version_stream(&store, &hash).await, data);
+
+        let copy_path = _temp_dir.path().join("copy.json");
+        store.copy_version_to_path(&hash, &copy_path).await.unwrap();
+        assert_path_contains(&copy_path, &data);
+    }
+
+    #[tokio::test]
+    async fn test_get_version_path_materializes_raw_file_for_compressed_version() {
+        let (_temp_dir, store) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let stored_path = store.version_path(&hash);
+        assert!(std::fs::read(&stored_path).unwrap() != data);
+
+        let local_path = store.get_version_path(&hash).await.unwrap();
+        assert_path_contains(local_path.as_ref(), &data);
+        assert_ne!(local_path.as_ref(), stored_path.as_path());
+    }
+
+    #[tokio::test]
+    async fn test_get_version_chunk_reads_raw_bytes_for_compressed_version() {
+        let (_temp_dir, store) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let chunk = store.get_version_chunk(&hash, 32, 128).await.unwrap();
+        assert_eq!(chunk, data[32..160]);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_identity_version_without_metadata_still_reads_raw_bytes() {
+        let (_temp_dir, store) = setup().await;
+        let data = b"legacy raw data without metadata";
+        let hash = hasher::hash_buffer(data);
+        let version_dir = store.version_dir(&hash);
+        fs::create_dir_all(&version_dir).await.unwrap();
+        fs::write(store.version_path(&hash), data).await.unwrap();
+
+        assert!(!version_metadata_path(&store, &hash).exists());
+        assert_eq!(
+            store.get_version_size(&hash).await.unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+        assert_eq!(collect_version_stream(&store, &hash).await, data);
+
+        let copy_path = _temp_dir.path().join("legacy-copy.txt");
+        store.copy_version_to_path(&hash, &copy_path).await.unwrap();
+        assert_path_contains(&copy_path, data);
+
+        let local_path = store.get_version_path(&hash).await.unwrap();
+        assert_path_contains(local_path.as_ref(), data);
+    }
+
+    #[tokio::test]
+    async fn test_incompressible_version_remains_identity_and_not_larger() {
+        let (_temp_dir, store) = setup().await;
+        let data = incompressible_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let stored_path = store.version_path(&hash);
+        let stored_len = std::fs::metadata(&stored_path).unwrap().len();
+        assert!(!version_metadata_path(&store, &hash).exists());
+        assert!(stored_len <= data.len() as u64);
+        assert_eq!(std::fs::read(&stored_path).unwrap(), data);
+        assert_eq!(store.get_version(&hash).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_clean_corrupted_versions_hashes_raw_bytes_for_compressed_version() {
+        let (_temp_dir, store) = setup().await;
+        let data = repeated_json_bytes();
+        let hash = hasher::hash_buffer(&data);
+
+        store.store_version(&hash, &data).await.unwrap();
+
+        let result = store.clean_corrupted_versions(false).await.unwrap();
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.corrupted, 0);
+        assert_eq!(result.cleaned, 0);
+        assert!(store.version_exists(&hash).await.unwrap());
     }
 
     #[tokio::test]
