@@ -45,11 +45,17 @@ pub use diff::DiffCmd;
 pub mod download;
 pub use download::DownloadCmd;
 
+pub mod drop;
+pub use drop::DropCmd;
+
 pub mod embeddings;
 pub use embeddings::EmbeddingsCmd;
 
 pub mod fetch;
 pub use fetch::FetchCmd;
+
+pub mod get;
+pub use get::GetCmd;
 
 pub mod info;
 pub use info::InfoCmd;
@@ -77,6 +83,9 @@ pub use merge::MergeCmd;
 
 pub mod node;
 pub use node::NodeCmd;
+
+pub mod offline;
+pub use offline::OfflineCmd;
 
 pub mod pack;
 pub use pack::PackCmd;
