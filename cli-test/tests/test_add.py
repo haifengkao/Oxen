@@ -55,6 +55,26 @@ class TestAddCommand:
         nested_path = Path("images") / "test" / "nested.txt"
         assert nested_path.read_text() == "nested\n"
 
+    def test_add_multiple_paths_runs_as_single_batch(self, test_dir, oxen):
+        """Test oxen add with multiple paths batches work into one add operation."""
+
+        repo_path = test_dir / "test-add-multiple-paths"
+        repo_path.mkdir(parents=True, exist_ok=True)
+        os.chdir(repo_path)
+
+        oxen.run("init")
+
+        create_test_file("dir_a/a.txt", "a\n")
+        create_test_file("dir_b/b.txt", "b\n")
+
+        result = oxen.run("add", "dir_a", "dir_b")
+
+        assert result.stdout.count("oxen added") == 1
+        assert "oxen added 2 files" in result.stdout
+
+        status = oxen.run("status")
+        assert status.returncode == 0
+
     def test_add_with_remote_mode_repo(self, test_dir, oxen, unique_id):
         """Test oxen add with remote mode repository."""
 
