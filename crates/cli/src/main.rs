@@ -89,6 +89,7 @@ async fn async_main() -> ExitCode {
         Box::new(cmd::FsckCmd),
         Box::new(cmd::PullCmd),
         Box::new(cmd::PushCmd),
+        Box::new(cmd::ResetCmd),
         Box::new(cmd::RestoreCmd),
         Box::new(cmd::RemoteCmd),
         Box::new(cmd::RmCmd),
@@ -175,7 +176,7 @@ async fn async_main() -> ExitCode {
                             return ExitCode::SUCCESS;
                         }
                         // Disallowed commands
-                        "embeddings" | "merge" | "push" | "workspace" => {
+                        "embeddings" | "merge" | "push" | "reset" | "workspace" => {
                             eprintln!(
                                 "Command `oxen {command}` not implemented for remote-mode repositories"
                             );
