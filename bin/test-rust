@@ -39,21 +39,59 @@ done
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
 # we don't need oxen-server collecting metrics during tests
 export OXEN_METRICS_PORT='off'
 
+python_for_dyld() {
+    local resolved_python
+
+    if [ -n "${PYO3_PYTHON:-}" ]; then
+        if resolved_python="$(command -v "$PYO3_PYTHON" 2>/dev/null)"; then
+            printf '%s\n' "$resolved_python"
+            return 0
+        fi
+
+        echo "ERROR: PYO3_PYTHON is set but is not executable: $PYO3_PYTHON" >&2
+        return 1
+    fi
+
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+        printf '%s\n' "$VIRTUAL_ENV/bin/python"
+        return 0
+    fi
+
+    if [ -x "oxen-python/.venv/bin/python" ]; then
+        printf '%s\n' "$PWD/oxen-python/.venv/bin/python"
+        return 0
+    fi
+
+    command -v python3 2>/dev/null || true
+}
+
+prepend_dyld_library_path() {
+    local libdir="$1"
+
+    case ":${DYLD_LIBRARY_PATH:-}:" in
+        *":$libdir:"*) ;;
+        *) export DYLD_LIBRARY_PATH="$libdir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
+    esac
+}
+
 # On macOS, SIP strips DYLD_LIBRARY_PATH from processes launched by system
 # binaries (like /usr/bin/env bash), so cargo nextest can't find libpython.
-# Re-derive the path from the active Python install if needed.
-if [ "$(uname)" = "Darwin" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ] && command -v python3 &>/dev/null; then
-    _pylib="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))' 2>/dev/null)"
-    if [ -n "$_pylib" ] && [ -d "$_pylib" ]; then
-        export DYLD_LIBRARY_PATH="$_pylib"
+# Re-derive the path from the Python that PyO3 should use.
+if [ "$(uname)" = "Darwin" ]; then
+    _python_for_dyld="$(python_for_dyld)"
+    if [ -n "$_python_for_dyld" ]; then
+        _pylib="$("$_python_for_dyld" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")' 2>/dev/null)"
+        if [ -n "$_pylib" ] && [ -d "$_pylib" ]; then
+            prepend_dyld_library_path "$_pylib"
+        fi
     fi
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/.."
 
 SERVER_PID=""
 RAMDISK_DEV=""
