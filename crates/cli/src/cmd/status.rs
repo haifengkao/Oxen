@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use clap::{Arg, ArgMatches, Command};
 
 use glob::glob;
+use liboxen::core::oxenignore;
 use liboxen::error::OxenError;
 use liboxen::model::staged_data::StagedDataOpts;
 use liboxen::model::{Branch, Commit, LocalRepository, StagedData, StagedEntryStatus};
@@ -104,7 +105,13 @@ impl RunCmd for StatusCmd {
         let head = repositories::commits::head_commit_maybe(&repository)?;
 
         if args.get_flag("json") {
-            let json = status_json_value(&repo_status, current_branch.as_ref(), head.as_ref());
+            let json = status_json_value(
+                &repo_status,
+                current_branch.as_ref(),
+                head.as_ref(),
+                Some(&repository),
+            )
+            .await?;
             println!("{}", serde_json::to_string(&json)?);
             return Ok(());
         }
@@ -127,11 +134,12 @@ impl RunCmd for StatusCmd {
     }
 }
 
-fn status_json_value(
+async fn status_json_value(
     repo_status: &StagedData,
     current_branch: Option<&Branch>,
     head: Option<&Commit>,
-) -> serde_json::Value {
+    repo: Option<&LocalRepository>,
+) -> Result<serde_json::Value, OxenError> {
     let mut staged = Vec::new();
     let mut working = Vec::new();
 
@@ -150,7 +158,7 @@ fn status_json_value(
     }
 
     let mut staged_files: Vec<_> = repo_status.staged_files.iter().collect();
-    staged_files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    staged_files.sort_by_key(|(path, _)| *path);
     for (path, entry) in staged_files {
         staged.push(status_entry_json(
             path,
@@ -188,7 +196,18 @@ fn status_json_value(
     let mut untracked_dirs = repo_status.untracked_dirs.clone();
     untracked_dirs.sort_by(|(a, _), (b, _)| a.cmp(b));
     for (path, num_files) in untracked_dirs {
-        working.push(status_entry_json(&path, "untracked", true, Some(num_files)));
+        if let Some(repo) = repo {
+            let file_paths = untracked_dir_file_paths(repo, &path).await?;
+            if file_paths.is_empty() {
+                working.push(status_entry_json(&path, "untracked", true, Some(num_files)));
+            } else {
+                for path in file_paths {
+                    working.push(status_entry_json(&path, "untracked", false, None));
+                }
+            }
+        } else {
+            working.push(status_entry_json(&path, "untracked", true, Some(num_files)));
+        }
     }
 
     let mut removed_files: Vec<_> = repo_status.removed_files.iter().collect();
@@ -197,7 +216,7 @@ fn status_json_value(
         working.push(status_entry_json(path, "removed", false, None));
     }
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "branch": current_branch.map(|branch| serde_json::json!({
             "name": branch.name,
             "commit_id": branch.commit_id,
@@ -209,7 +228,37 @@ fn status_json_value(
         "is_clean": repo_status.is_clean(),
         "staged": staged,
         "working": working,
-    })
+    }))
+}
+
+async fn untracked_dir_file_paths(
+    repo: &LocalRepository,
+    dir_path: &Path,
+) -> Result<Vec<PathBuf>, OxenError> {
+    let gitignore = oxenignore::create(repo);
+    let mut dirs = vec![dir_path.to_path_buf()];
+    let mut files = Vec::new();
+
+    while let Some(relative_dir) = dirs.pop() {
+        let full_dir = repo.path.join(&relative_dir);
+        let mut entries = tokio::fs::read_dir(&full_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            let relative_path = relative_dir.join(entry.file_name());
+            let is_dir = file_type.is_dir();
+            if oxenignore::is_ignored(&relative_path, &gitignore, is_dir) {
+                continue;
+            }
+            if is_dir {
+                dirs.push(relative_path);
+            } else if file_type.is_file() || file_type.is_symlink() {
+                files.push(relative_path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
 }
 
 fn status_entry_json(
@@ -263,10 +312,12 @@ fn parse_ignore_files(paths: Option<&String>) -> Option<HashSet<PathBuf>> {
 mod tests {
     use super::*;
     use liboxen::model::{StagedData, StagedEntry, StagedEntryStatus};
+    use liboxen::{repositories, util};
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
-    #[test]
-    fn status_json_groups_staged_and_working_entries() {
+    #[tokio::test]
+    async fn status_json_groups_staged_and_working_entries() -> Result<(), OxenError> {
         let mut status = StagedData::empty();
         status.staged_files.insert(
             PathBuf::from("tracked.yml"),
@@ -277,7 +328,7 @@ mod tests {
         status.untracked_dirs.push((PathBuf::from("assets"), 3));
         status.removed_files.insert(PathBuf::from("old.har"));
 
-        let json = status_json_value(&status, None, None);
+        let json = status_json_value(&status, None, None, None).await?;
 
         assert_eq!(
             json,
@@ -321,5 +372,40 @@ mod tests {
                 ]
             })
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_json_expands_untracked_dirs_when_repo_available() -> Result<(), OxenError> {
+        let temp_dir = TempDir::new()?;
+        let repo = repositories::init(temp_dir.path())?;
+        util::fs::write_to_path(repo.path.join("episode/yml/step_000.yml"), "step: 0\n")?;
+        util::fs::write_to_path(repo.path.join("episode/yml/step_001.yml"), "step: 1\n")?;
+
+        let mut status = StagedData::empty();
+        status.untracked_dirs.push((PathBuf::from("episode"), 2));
+
+        let json = status_json_value(&status, None, None, Some(&repo)).await?;
+
+        assert_eq!(
+            json["working"],
+            serde_json::json!([
+                {
+                    "path": "episode/yml/step_000.yml",
+                    "status": "untracked",
+                    "is_directory": false,
+                    "num_files": null
+                },
+                {
+                    "path": "episode/yml/step_001.yml",
+                    "status": "untracked",
+                    "is_directory": false,
+                    "num_files": null
+                }
+            ])
+        );
+
+        Ok(())
     }
 }
