@@ -4,7 +4,7 @@ use colored::ColoredString;
 use colored::Colorize;
 use minus::Pager;
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use liboxen::core::df::pretty_print;
 use liboxen::core::df::tabular;
@@ -157,7 +157,7 @@ fn name_status_entries(status: &StagedData) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
 
     let mut staged_files: Vec<_> = status.staged_files.iter().collect();
-    staged_files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    staged_files.sort_by_key(|(path, _)| *path);
     for (path, entry) in staged_files {
         entries.push(name_status_entry_json(
             path,
@@ -215,7 +215,7 @@ fn name_status_entries(status: &StagedData) -> Vec<serde_json::Value> {
 }
 
 fn name_status_entry_json(
-    path: &PathBuf,
+    path: &Path,
     status: &str,
     is_directory: bool,
     area: &str,
@@ -246,7 +246,7 @@ fn staged_entry_status_str(status: &StagedEntryStatus) -> &'static str {
     }
 }
 
-fn path_to_string(path: &PathBuf) -> String {
+fn path_to_string(path: &Path) -> String {
     path.to_str()
         .expect("Oxen diff paths must be valid UTF-8")
         .to_string()

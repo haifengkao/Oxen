@@ -137,48 +137,6 @@ impl RunCmd for BranchCmd {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use liboxen::model::Branch;
-
-    #[test]
-    fn branch_json_marks_current_branch() {
-        let main = Branch {
-            name: "main".to_string(),
-            commit_id: "abc123".to_string(),
-        };
-        let dev = Branch {
-            name: "dev".to_string(),
-            commit_id: "def456".to_string(),
-        };
-
-        let json = branch_json_value(&[dev.clone(), main.clone()], Some(&main));
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "current": {
-                    "name": "main",
-                    "commit_id": "abc123"
-                },
-                "branches": [
-                    {
-                        "name": "dev",
-                        "commit_id": "def456",
-                        "is_current": false
-                    },
-                    {
-                        "name": "main",
-                        "commit_id": "abc123",
-                        "is_current": true
-                    }
-                ]
-            })
-        );
-    }
-}
-
 fn branch_json_value(branches: &[Branch], current_branch: Option<&Branch>) -> serde_json::Value {
     let mut branches = branches.to_vec();
     branches.sort_by(|a, b| a.name.cmp(&b.name));
@@ -335,5 +293,47 @@ impl BranchCmd {
 
         api::client::branches::delete_remote(repo, remote_name, branch_name).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liboxen::model::Branch;
+
+    #[test]
+    fn branch_json_marks_current_branch() {
+        let main = Branch {
+            name: "main".to_string(),
+            commit_id: "abc123".to_string(),
+        };
+        let dev = Branch {
+            name: "dev".to_string(),
+            commit_id: "def456".to_string(),
+        };
+
+        let json = branch_json_value(&[dev.clone(), main.clone()], Some(&main));
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "current": {
+                    "name": "main",
+                    "commit_id": "abc123"
+                },
+                "branches": [
+                    {
+                        "name": "dev",
+                        "commit_id": "def456",
+                        "is_current": false
+                    },
+                    {
+                        "name": "main",
+                        "commit_id": "abc123",
+                        "is_current": true
+                    }
+                ]
+            })
+        );
     }
 }
