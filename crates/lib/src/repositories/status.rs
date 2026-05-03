@@ -552,6 +552,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_status_rm_regular_file_with_file_search_path() -> Result<(), OxenError> {
+        test::run_training_data_repo_test_fully_committed_async(|repo| async move {
+            let og_basename = PathBuf::from("README.md");
+            let og_file = repo.path.join(&og_basename);
+            util::fs::remove_file(og_file)?;
+
+            let opts = StagedDataOpts::from_paths(&[repo.path.join(&og_basename)]);
+            let status = repositories::status::status_from_opts(&repo, &opts)?;
+            status.print();
+
+            assert_eq!(status.removed_files.len(), 1);
+            assert!(status.removed_files.contains(&og_basename));
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
     async fn test_status_rm_directory_file() -> Result<(), OxenError> {
         test::run_training_data_repo_test_fully_committed_async(|repo| async move {
             // Move the file to a new name

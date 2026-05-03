@@ -66,16 +66,16 @@ pub fn status_from_opts(
 
     for dir in opts.paths.iter() {
         let relative_dir = util::fs::path_relative_to_dir(dir, &repo.path)?;
-        let (sub_untracked, sub_modified, sub_removed) = find_changes(
+        let scan_context = FindChangesContext {
             repo,
             opts,
-            &relative_dir,
-            &staged_db_maybe,
-            &dir_hashes,
-            &offline_index,
-            &read_progress,
-            &mut total_entries,
-        )?;
+            staged_db: &staged_db_maybe,
+            dir_hashes: &dir_hashes,
+            offline_index: &offline_index,
+            progress: &read_progress,
+        };
+        let (sub_untracked, sub_modified, sub_removed) =
+            find_changes(&scan_context, &relative_dir, &mut total_entries)?;
         untracked.merge(sub_untracked);
         modified.extend(sub_modified);
         removed.extend(sub_removed);
@@ -142,16 +142,16 @@ pub fn status_from_opts_and_staged_data(
 
     for dir in opts.paths.iter() {
         let relative_dir = util::fs::path_relative_to_dir(dir, &repo.path)?;
-        let (sub_untracked, sub_unsynced, sub_modified, sub_removed) = find_local_changes(
+        let scan_context = FindLocalChangesContext {
             repo,
             opts,
-            &relative_dir,
             staged_data,
-            &dir_hashes,
-            &offline_index,
-            &read_progress,
-            &mut total_entries,
-        )?;
+            dir_hashes: &dir_hashes,
+            offline_index: &offline_index,
+            progress: &read_progress,
+        };
+        let (sub_untracked, sub_unsynced, sub_modified, sub_removed) =
+            find_local_changes(&scan_context, &relative_dir, &mut total_entries)?;
 
         untracked.merge(sub_untracked);
         unsynced.merge(sub_unsynced);
@@ -447,16 +447,26 @@ pub fn read_staged_entries_below_path(
     Ok((dir_entries, total_entries))
 }
 
+struct FindChangesContext<'a> {
+    repo: &'a LocalRepository,
+    opts: &'a StagedDataOpts,
+    staged_db: &'a Option<DBWithThreadMode<SingleThreaded>>,
+    dir_hashes: &'a HashMap<PathBuf, MerkleHash>,
+    offline_index: &'a OfflineIndex,
+    progress: &'a ProgressBar,
+}
+
 fn find_changes(
-    repo: &LocalRepository,
-    opts: &StagedDataOpts,
+    context: &FindChangesContext<'_>,
     search_node_path: impl AsRef<Path>,
-    staged_db: &Option<DBWithThreadMode<SingleThreaded>>,
-    dir_hashes: &HashMap<PathBuf, MerkleHash>,
-    offline_index: &OfflineIndex,
-    progress: &ProgressBar,
     total_entries: &mut usize,
 ) -> Result<(UntrackedData, HashSet<PathBuf>, HashSet<PathBuf>), OxenError> {
+    let repo = context.repo;
+    let opts = context.opts;
+    let staged_db = context.staged_db;
+    let dir_hashes = context.dir_hashes;
+    let offline_index = context.offline_index;
+    let progress = context.progress;
     let search_node_path = search_node_path.as_ref();
     let full_path = repo.path.join(search_node_path);
     let is_dir = full_path.is_dir();
@@ -472,6 +482,19 @@ fn find_changes(
     let mut modified = HashSet::new();
     let mut removed = HashSet::new();
     let gitignore: Option<Gitignore> = oxenignore::create(repo);
+    let search_node = maybe_get_node(repo, dir_hashes, search_node_path)?;
+
+    if !full_path.exists()
+        && let Some(node) = &search_node
+        && let EMerkleTreeNode::File(file_node) = &node.node
+    {
+        if !is_staged(search_node_path, staged_db)?
+            && !offline_index.is_current(search_node_path, &file_node.hash().to_string())?
+        {
+            removed.insert(search_node_path.to_path_buf());
+        }
+        return Ok((untracked, modified, removed));
+    }
 
     let mut entries: Vec<(PathBuf, bool, Result<std::fs::Metadata, OxenError>)> = Vec::new();
     if is_dir {
@@ -504,7 +527,6 @@ fn find_changes(
         entries.push((full_path.to_owned(), false, metadata));
     }
     let mut untracked_count = 0;
-    let search_node = maybe_get_node(repo, dir_hashes, search_node_path)?;
     let dir_children = maybe_get_dir_children(&search_node)?;
 
     for (path, is_dir, metadata) in entries {
@@ -525,16 +547,8 @@ fn find_changes(
         if is_dir {
             log::debug!("find_changes entry is a directory {path:?}");
             // If it's a directory, recursively find changes below it
-            let (sub_untracked, sub_modified, sub_removed) = find_changes(
-                repo,
-                opts,
-                &relative_path,
-                staged_db,
-                dir_hashes,
-                offline_index,
-                progress,
-                total_entries,
-            )?;
+            let (sub_untracked, sub_modified, sub_removed) =
+                find_changes(context, &relative_path, total_entries)?;
             untracked.merge(sub_untracked);
             modified.extend(sub_modified);
             removed.extend(sub_removed)
@@ -663,14 +677,18 @@ fn find_changes(
     Ok((untracked, modified, removed))
 }
 
+struct FindLocalChangesContext<'a> {
+    repo: &'a LocalRepository,
+    opts: &'a StagedDataOpts,
+    staged_data: &'a StagedData,
+    dir_hashes: &'a HashMap<PathBuf, MerkleHash>,
+    offline_index: &'a OfflineIndex,
+    progress: &'a ProgressBar,
+}
+
 fn find_local_changes(
-    repo: &LocalRepository,
-    opts: &StagedDataOpts,
+    context: &FindLocalChangesContext<'_>,
     search_node_path: impl AsRef<Path>,
-    staged_data: &StagedData,
-    dir_hashes: &HashMap<PathBuf, MerkleHash>,
-    offline_index: &OfflineIndex,
-    progress: &ProgressBar,
     total_entries: &mut usize,
 ) -> Result<
     (
@@ -681,6 +699,12 @@ fn find_local_changes(
     ),
     OxenError,
 > {
+    let repo = context.repo;
+    let opts = context.opts;
+    let staged_data = context.staged_data;
+    let dir_hashes = context.dir_hashes;
+    let offline_index = context.offline_index;
+    let progress = context.progress;
     let search_node_path = search_node_path.as_ref();
     let full_path = repo.path.join(search_node_path);
     let is_dir = full_path.is_dir();
@@ -750,16 +774,8 @@ fn find_local_changes(
         if is_dir {
             log::debug!("find_changes entry is a directory {path:?}");
             // If it's a directory, recursively find changes below it
-            let (sub_untracked, sub_unsynced, sub_modified, sub_removed) = find_local_changes(
-                repo,
-                opts,
-                &relative_path,
-                staged_data,
-                dir_hashes,
-                offline_index,
-                progress,
-                total_entries,
-            )?;
+            let (sub_untracked, sub_unsynced, sub_modified, sub_removed) =
+                find_local_changes(context, &relative_path, total_entries)?;
             untracked.merge(sub_untracked);
             unsynced.merge(sub_unsynced);
             modified.extend(sub_modified);
