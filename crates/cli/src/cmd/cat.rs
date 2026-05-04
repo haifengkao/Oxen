@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use clap::{Arg, Command};
-use liboxen::core::staged::get_staged_db_manager;
+use liboxen::core::staged::read_from_staged_db_read_only;
 use liboxen::error::OxenError;
 use liboxen::model::{LocalRepository, StagedEntryStatus};
 use liboxen::{repositories, util};
@@ -32,8 +32,7 @@ async fn read_staged_file(
     path: impl AsRef<Path>,
 ) -> Result<Vec<u8>, OxenError> {
     let path = path.as_ref();
-    let staged_node = get_staged_db_manager(repo)?
-        .read_from_staged_db(path)?
+    let staged_node = read_from_staged_db_read_only(repo, path)?
         .ok_or_else(|| OxenError::basic_str(format!("No staged entry found for {path:?}")))?;
 
     if staged_node.status == StagedEntryStatus::Removed {
@@ -115,7 +114,54 @@ impl RunCmd for CatCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use liboxen::constants::STAGED_DIR;
+    use liboxen::core;
     use liboxen::{repositories, test, util};
+    use std::fs;
+    use std::time::SystemTime;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct StagedFileSnapshot {
+        path: PathBuf,
+        len: u64,
+        modified: Option<SystemTime>,
+    }
+
+    fn staged_file_snapshot(repo: &LocalRepository) -> Result<Vec<StagedFileSnapshot>, OxenError> {
+        fn collect(
+            root: &Path,
+            dir: &Path,
+            snapshots: &mut Vec<StagedFileSnapshot>,
+        ) -> Result<(), OxenError> {
+            if !dir.exists() {
+                return Ok(());
+            }
+
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+
+                if metadata.is_dir() {
+                    collect(root, &path, snapshots)?;
+                } else {
+                    snapshots.push(StagedFileSnapshot {
+                        path: util::fs::path_relative_to_dir(&path, root)?,
+                        len: metadata.len(),
+                        modified: metadata.modified().ok(),
+                    });
+                }
+            }
+
+            Ok(())
+        }
+
+        let staged_dir = util::fs::oxen_hidden_dir(&repo.path).join(STAGED_DIR);
+        let mut snapshots = Vec::new();
+        collect(&staged_dir, &staged_dir, &mut snapshots)?;
+        snapshots.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(snapshots)
+    }
 
     #[tokio::test]
     async fn read_staged_file_reads_index_content_without_touching_worktree()
@@ -135,6 +181,32 @@ mod tests {
 
             assert_eq!(String::from_utf8(data).unwrap(), "staged\n");
             assert_eq!(util::fs::read_from_path(&file_path)?, "working\n");
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn read_staged_file_does_not_mutate_staged_db_metadata() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let relative_path = PathBuf::from("hello.txt");
+            let file_path = repo.path.join(&relative_path);
+            util::fs::write_to_path(&file_path, "committed\n")?;
+            repositories::add(&repo, &file_path).await?;
+            repositories::commit(&repo, "Add hello")?;
+
+            util::fs::write_to_path(&file_path, "staged\n")?;
+            repositories::add(&repo, &file_path).await?;
+
+            core::staged::remove_from_cache(&repo.path)?;
+            let before = staged_file_snapshot(&repo)?;
+
+            let data = read_staged_file(&repo, &relative_path).await?;
+            assert_eq!(String::from_utf8(data).unwrap(), "staged\n");
+
+            let after = staged_file_snapshot(&repo)?;
+            assert_eq!(before, after);
+
             Ok(())
         })
         .await

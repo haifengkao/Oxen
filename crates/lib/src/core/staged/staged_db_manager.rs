@@ -127,10 +127,64 @@ pub fn get_staged_db_manager(repository: &LocalRepository) -> Result<StagedDBMan
     })
 }
 
+pub fn read_from_staged_db_read_only(
+    repository: &LocalRepository,
+    path: impl AsRef<Path>,
+) -> Result<Option<StagedMerkleTreeNode>, OxenError> {
+    let staged_db_dir = util::fs::oxen_hidden_dir(&repository.path).join(STAGED_DIR);
+
+    let cached_db = {
+        let cache_r = DB_INSTANCES.read();
+        cache_r.peek(&staged_db_dir).cloned()
+    };
+
+    if let Some(db_lock) = cached_db {
+        return StagedDBManager {
+            staged_db: db_lock,
+            repository: repository.clone(),
+        }
+        .read_from_staged_db(path);
+    }
+
+    if !staged_db_dir.join("CURRENT").exists() {
+        return Ok(None);
+    }
+
+    let mut opts = db::key_val::opts::default();
+    opts.create_if_missing(false);
+    let db =
+        DB::open_for_read_only(&opts, dunce::simplified(&staged_db_dir), false).map_err(|e| {
+            log::error!("Failed to open staged db read-only: {e}");
+            OxenError::basic_str(format!("Failed to open staged db read-only: {e}"))
+        })?;
+    read_staged_node_from_db(&db, path)
+}
+
 /// Normalizes a path to use forward slashes for use as a DB key.
 /// This ensures cross-platform consistency since DB keys should be platform-agnostic.
 fn normalize_key(path: impl AsRef<Path>) -> String {
     path.as_ref().to_string_lossy().replace('\\', "/")
+}
+
+fn read_staged_node_from_db(
+    db: &DB,
+    path: impl AsRef<Path>,
+) -> Result<Option<StagedMerkleTreeNode>, OxenError> {
+    let key = normalize_key(&path);
+
+    let data = match db.get(key.as_bytes())? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    match rmp_serde::from_slice(&data) {
+        Ok(val) => Ok(Some(val)),
+        Err(e) => {
+            log::error!("Failed to deserialize data for key {key}: {e}");
+            Err(OxenError::basic_str(format!(
+                "Failed to deserialize staged data: {e}"
+            )))
+        }
+    }
 }
 
 impl StagedDBManager {
@@ -267,22 +321,8 @@ impl StagedDBManager {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<Option<StagedMerkleTreeNode>, OxenError> {
-        let key = normalize_key(&path);
-
         let db_r = self.staged_db.read();
-        let data = match db_r.get(key.as_bytes())? {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        match rmp_serde::from_slice(&data) {
-            Ok(val) => Ok(Some(val)),
-            Err(e) => {
-                log::error!("Failed to deserialize data for key {key}: {e}");
-                Err(OxenError::basic_str(format!(
-                    "Failed to deserialize staged data: {e}"
-                )))
-            }
-        }
+        read_staged_node_from_db(&db_r, path)
     }
 
     /// Read all entries below a path from the staged db
