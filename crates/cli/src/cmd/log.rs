@@ -53,6 +53,12 @@ impl RunCmd for LogCmd {
                     .help("Print machine-readable JSON.")
                     .action(clap::ArgAction::SetTrue),
             )
+            .arg(
+                Arg::new("no_count_cache")
+                    .long("no-count-cache")
+                    .help("Do not read or write the commit count cache while listing history.")
+                    .action(clap::ArgAction::SetTrue),
+            )
     }
 
     async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
@@ -70,8 +76,15 @@ impl RunCmd for LogCmd {
             .parse::<usize>()
             .expect("skip must be a valid integer.");
         let revision = args.get_one::<String>("revision").map(String::from);
-        self.log_commits(&repo, revision, skip, num_commits, args.get_flag("json"))
-            .await?;
+        self.log_commits(
+            &repo,
+            revision,
+            skip,
+            num_commits,
+            args.get_flag("json"),
+            args.get_flag("no_count_cache"),
+        )
+        .await?;
 
         Ok(())
     }
@@ -105,13 +118,26 @@ impl LogCmd {
         skip: usize,
         num_commits: usize,
         as_json: bool,
+        no_count_cache: bool,
     ) -> Result<(), OxenError> {
         let revision = match revision {
             Some(revision) => revision,
             None => repositories::commits::head_commit(repo)?.id,
         };
-        let commits = repositories::commits::list_from(repo, &revision)?;
-        let commits: Vec<Commit> = commits.into_iter().skip(skip).take(num_commits).collect();
+        let commits = if no_count_cache {
+            repositories::commits::list_from_without_count_cache(
+                repo,
+                &revision,
+                skip,
+                num_commits,
+            )?
+        } else {
+            repositories::commits::list_from(repo, &revision)?
+                .into_iter()
+                .skip(skip)
+                .take(num_commits)
+                .collect()
+        };
 
         if as_json {
             println!("{}", serde_json::to_string(&log_json_value(&commits))?);
@@ -149,6 +175,8 @@ impl LogCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use liboxen::constants::COMMIT_COUNT_DIR;
+    use liboxen::{test, util};
     use time::OffsetDateTime;
 
     #[test]
@@ -179,5 +207,31 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn log_commits_without_count_cache_does_not_create_commit_count_db()
+    -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            for i in 0..3 {
+                let file_path = repo.path.join(format!("file_{i}.txt"));
+                test::write_txt_file_to_path(&file_path, format!("Content {i}"))?;
+
+                repositories::add(&repo, &file_path).await?;
+                repositories::commit(&repo, &format!("Commit {i}"))?;
+            }
+
+            let commit_count_dir = util::fs::oxen_hidden_dir(&repo.path).join(COMMIT_COUNT_DIR);
+            assert!(!commit_count_dir.exists());
+
+            LogCmd
+                .log_commits(&repo, Some("main".to_string()), 0, 2, true, true)
+                .await?;
+
+            assert!(!commit_count_dir.exists());
+
+            Ok(())
+        })
+        .await
     }
 }
