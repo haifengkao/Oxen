@@ -19,10 +19,8 @@ impl NodeMergeConflictReader {
         log::debug!("NodeMergeConflictReader::new() DB {db_path:?}");
 
         let opts = db::key_val::opts::default();
-        if !db_path.exists() {
-            util::fs::create_dir_all(&db_path)?;
-            // open it then lose scope to close it
-            let _db = DB::open(&opts, dunce::simplified(&db_path))?;
+        if !db_path.join("CURRENT").exists() {
+            return Err(OxenError::NoMergeInProgress);
         }
 
         Ok(NodeMergeConflictReader {

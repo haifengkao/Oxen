@@ -52,6 +52,12 @@ pub struct RefManager {
     repository: LocalRepository,
 }
 
+pub struct RefReader {
+    refs_db: Option<Arc<DB>>,
+    head_file: PathBuf,
+    repository: LocalRepository,
+}
+
 pub fn with_ref_manager<F, T>(repository: &LocalRepository, operation: F) -> Result<T, OxenError>
 where
     F: FnOnce(&RefManager) -> Result<T, OxenError>,
@@ -91,6 +97,199 @@ where
 
     // Execute the operation with our RefManager instance
     operation(&manager)
+}
+
+pub fn with_ref_reader<F, T>(repository: &LocalRepository, operation: F) -> Result<T, OxenError>
+where
+    F: FnOnce(&RefReader) -> Result<T, OxenError>,
+{
+    let refs_db = {
+        let refs_dir = util::fs::oxen_hidden_dir(&repository.path).join(REFS_DIR);
+
+        let cached_db = {
+            let mut instances = DB_INSTANCES.lock();
+            instances.get(&refs_dir).cloned()
+        };
+
+        if cached_db.is_some() {
+            cached_db
+        } else if refs_dir.join("CURRENT").exists() {
+            let mut opts = db::key_val::opts::default();
+            opts.create_if_missing(false);
+            let db = DB::open_for_read_only(&opts, dunce::simplified(&refs_dir), false).map_err(
+                |e| {
+                    log::error!("Failed to open refs database read-only: {e}");
+                    OxenError::basic_str(format!("Failed to open refs database read-only: {e}"))
+                },
+            )?;
+            Some(Arc::new(db))
+        } else {
+            None
+        }
+    };
+
+    let reader = RefReader {
+        refs_db,
+        head_file: util::fs::oxen_hidden_dir(&repository.path).join(HEAD_FILE),
+        repository: repository.clone(),
+    };
+
+    operation(&reader)
+}
+
+impl RefReader {
+    pub fn has_branch(&self, name: &str) -> bool {
+        let Some(refs_db) = &self.refs_db else {
+            return false;
+        };
+
+        let bytes = name.as_bytes();
+        match refs_db.get(bytes) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => false,
+        }
+    }
+
+    pub fn get_current_branch(&self) -> Result<Option<Branch>, OxenError> {
+        let ref_name = self.read_head_ref()?;
+        if ref_name.is_none() {
+            return Ok(None);
+        }
+
+        let ref_name = ref_name.unwrap();
+        if let Some(id) = self.get_commit_id_for_branch(&ref_name)? {
+            Ok(Some(Branch {
+                name: ref_name,
+                commit_id: id,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_commit_id_for_branch(&self, name: &str) -> Result<Option<String>, OxenError> {
+        let Some(refs_db) = &self.refs_db else {
+            return Ok(None);
+        };
+
+        let bytes = name.as_bytes();
+        match refs_db.get(bytes) {
+            Ok(Some(value)) => Ok(Some(String::from(str::from_utf8(&value)?))),
+            Ok(None) => Ok(None),
+            Err(err) => {
+                log::error!("get_commit_id_for_branch error finding commit id for branch {name}");
+                Err(OxenError::basic_str(err))
+            }
+        }
+    }
+
+    pub fn head_commit_id(&self) -> Result<Option<String>, OxenError> {
+        let head_ref = self.read_head_ref()?;
+
+        if let Some(head_ref) = head_ref {
+            if let Some(commit_id) = self.get_commit_id_for_branch(&head_ref)? {
+                Ok(Some(commit_id))
+            } else if repositories::commits::commit_id_exists(&self.repository, &head_ref)? {
+                Ok(Some(head_ref))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn read_head_ref(&self) -> Result<Option<String>, OxenError> {
+        if self.head_file.exists() {
+            Ok(Some(util::fs::read_from_path(&self.head_file)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_branches(&self) -> Result<Vec<Branch>, OxenError> {
+        let Some(refs_db) = &self.refs_db else {
+            return Ok(Vec::new());
+        };
+
+        let mut branch_names: Vec<Branch> = vec![];
+        let iter = refs_db.iterator(IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((key, value)) => match (str::from_utf8(&key), str::from_utf8(&value)) {
+                    (Ok(key_str), Ok(value)) => {
+                        let ref_name = String::from(key_str);
+                        let id = String::from(value);
+                        branch_names.push(Branch {
+                            name: ref_name,
+                            commit_id: id,
+                        });
+                    }
+                    _ => {
+                        return Err(OxenError::basic_str("Could not read utf8 val..."));
+                    }
+                },
+                Err(err) => {
+                    let err = format!("Error reading refs db\nErr: {err}");
+                    return Err(OxenError::basic_str(err));
+                }
+            }
+        }
+        Ok(branch_names)
+    }
+
+    pub fn list_branches_with_commits(&self) -> Result<Vec<(Branch, Commit)>, OxenError> {
+        let Some(refs_db) = &self.refs_db else {
+            return Ok(Vec::new());
+        };
+
+        let mut branch_names: Vec<(Branch, Commit)> = vec![];
+        let maybe_head_ref = self.read_head_ref()?;
+        let iter = refs_db.iterator(IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((key, value)) => match (str::from_utf8(&key), str::from_utf8(&value)) {
+                    (Ok(key_str), Ok(value)) => {
+                        if maybe_head_ref.is_some() {
+                            let ref_name = String::from(key_str);
+                            let id = String::from(value);
+                            let ref_commit = repositories::commits::get_commit_or_head(
+                                &self.repository,
+                                Some(ref_name.clone()),
+                            )?;
+                            branch_names.push((
+                                Branch {
+                                    name: ref_name,
+                                    commit_id: id,
+                                },
+                                ref_commit,
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(OxenError::basic_str("Could not read utf8 val..."));
+                    }
+                },
+                Err(err) => {
+                    let err = format!("Error reading refs db\nErr: {err}");
+                    return Err(OxenError::basic_str(err));
+                }
+            }
+        }
+        Ok(branch_names)
+    }
+
+    pub fn get_branch_by_name(&self, name: &str) -> Result<Option<Branch>, OxenError> {
+        match self.get_commit_id_for_branch(name) {
+            Ok(Some(commit_id)) => Ok(Some(Branch {
+                name: name.to_string(),
+                commit_id: commit_id.to_string(),
+            })),
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 impl RefManager {

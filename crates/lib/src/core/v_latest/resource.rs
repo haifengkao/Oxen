@@ -1,4 +1,4 @@
-use crate::core::refs::with_ref_manager;
+use crate::core::refs::with_ref_reader;
 
 use crate::error::OxenError;
 use crate::model::{Branch, Commit, LocalRepository, ParsedResource, Workspace};
@@ -150,8 +150,7 @@ fn try_parse_as_branch(
         let branch_name =
             util::fs::linux_path_str(joined.to_str().expect("non-UTF-8 resource path"));
 
-        let maybe_branch =
-            with_ref_manager(repo, |manager| manager.get_branch_by_name(&branch_name))?;
+        let maybe_branch = with_ref_reader(repo, |reader| reader.get_branch_by_name(&branch_name))?;
 
         if let Some(branch) = maybe_branch {
             let file_path = if file_components.is_empty() {
