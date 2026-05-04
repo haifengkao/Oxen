@@ -210,6 +210,18 @@ pub fn list_from(repo: &LocalRepository, revision: &str) -> Result<Vec<Commit>, 
     }
 }
 
+pub fn list_from_without_count_cache(
+    repo: &LocalRepository,
+    revision: &str,
+    skip: usize,
+    limit: usize,
+) -> Result<Vec<Commit>, OxenError> {
+    match repo.min_version() {
+        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
+        _ => core::v_latest::commits::list_from_without_count_cache(repo, revision, skip, limit),
+    }
+}
+
 pub fn list_from_with_depth(
     repo: &LocalRepository,
     revision: &str,

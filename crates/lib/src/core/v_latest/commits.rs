@@ -661,6 +661,35 @@ pub fn list_from(
     Ok(commits)
 }
 
+pub fn list_from_without_count_cache(
+    repo: &LocalRepository,
+    revision: impl AsRef<str>,
+    skip: usize,
+    limit: usize,
+) -> Result<Vec<Commit>, OxenError> {
+    let revision = revision.as_ref();
+    if revision.contains("..") {
+        let split: Vec<&str> = revision.split("..").collect();
+        let base = split[0];
+        let head = split[1];
+        let base_commit = repositories::commits::get_by_id(repo, base)?
+            .ok_or_else(|| OxenError::RevisionNotFound(base.into()))?;
+        let head_commit = repositories::commits::get_by_id(repo, head)?
+            .ok_or_else(|| OxenError::RevisionNotFound(head.into()))?;
+
+        let (commits, _) =
+            list_recursive_paginated(repo, head_commit, skip, limit, Some(&base_commit), None)?;
+        return Ok(commits);
+    }
+
+    let commit = repositories::revisions::get(repo, revision)?;
+    if let Some(commit) = commit {
+        return list_forward_paginated(repo, commit, skip, limit);
+    }
+
+    Ok(vec![])
+}
+
 pub fn list_from_paginated_impl(
     repo: &LocalRepository,
     revision: impl AsRef<str>,
@@ -1100,6 +1129,37 @@ mod tests {
                 "Second result should be C7, got {}",
                 paginated_commits[1].message
             );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_list_from_without_count_cache_does_not_create_commit_count_db()
+    -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let mut commit_ids = Vec::new();
+
+            for i in 0..3 {
+                let filename = format!("file_{i}.txt");
+                let file_path = repo.path.join(&filename);
+                test::write_txt_file_to_path(&file_path, format!("Content {i}"))?;
+
+                repositories::add(&repo, &file_path).await?;
+                let commit = repositories::commit(&repo, &format!("Commit {i}"))?;
+                commit_ids.push(commit.id.clone());
+            }
+
+            let commit_count_dir =
+                crate::util::fs::oxen_hidden_dir(&repo.path).join(COMMIT_COUNT_DIR);
+            assert!(!commit_count_dir.exists());
+
+            let commits = list_from_without_count_cache(&repo, "main", 1, 1)?;
+
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].id, commit_ids[1]);
+            assert!(!commit_count_dir.exists());
 
             Ok(())
         })
