@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::refs::with_ref_manager;
+use crate::core::refs::{with_ref_manager, with_ref_reader};
 use crate::core::v_latest::branches::OnConflict;
 use crate::core::versions::MinOxenVersion;
 use crate::error::OxenError;
@@ -15,23 +15,23 @@ use crate::{core, util};
 
 /// List all the local branches within a repo
 pub fn list(repo: &LocalRepository) -> Result<Vec<Branch>, OxenError> {
-    with_ref_manager(repo, |manager| manager.list_branches())
+    with_ref_reader(repo, |reader| reader.list_branches())
 }
 
 /// List all the local branches within a repo along with their head commits
 pub fn list_with_commits(repo: &LocalRepository) -> Result<Vec<(Branch, Commit)>, OxenError> {
-    with_ref_manager(repo, |manager| manager.list_branches_with_commits())
+    with_ref_reader(repo, |reader| reader.list_branches_with_commits())
 }
 
 /// Get a branch by name, returning an error if it doesn't exist
 pub fn get_by_name(repo: &LocalRepository, name: &str) -> Result<Branch, OxenError> {
-    with_ref_manager(repo, |manager| manager.get_branch_by_name(name))?
+    with_ref_reader(repo, |reader| reader.get_branch_by_name(name))?
         .ok_or_else(|| OxenError::local_branch_not_found(name))
 }
 
 /// Get commit id from a branch by name
 pub fn get_commit_id(repo: &LocalRepository, name: &str) -> Result<Option<String>, OxenError> {
-    with_ref_manager(repo, |manager| manager.get_commit_id_for_branch(name))
+    with_ref_reader(repo, |reader| reader.get_commit_id_for_branch(name))
 }
 
 /// Check if a branch exists.
@@ -47,7 +47,7 @@ pub fn exists(repo: &LocalRepository, name: &str) -> Result<bool, OxenError> {
 
 /// Get the current branch
 pub fn current_branch(repo: &LocalRepository) -> Result<Option<Branch>, OxenError> {
-    with_ref_manager(repo, |manager| manager.get_current_branch())
+    with_ref_reader(repo, |reader| reader.get_current_branch())
 }
 
 /// # Create a new branch from the head commit
@@ -157,8 +157,7 @@ pub fn force_delete(repo: &LocalRepository, name: impl AsRef<str>) -> Result<Bra
 
 /// Check if a branch is checked out
 pub fn is_checked_out(repo: &LocalRepository, name: &str) -> bool {
-    if let Ok(Some(current_branch)) = with_ref_manager(repo, |manager| manager.get_current_branch())
-    {
+    if let Ok(Some(current_branch)) = current_branch(repo) {
         // If we are already on the branch, do nothing
         if current_branch.name == name {
             return true;
@@ -223,9 +222,9 @@ pub fn set_head(repo: &LocalRepository, value: impl AsRef<str>) -> Result<(), Ox
 }
 
 fn branch_has_been_merged(repo: &LocalRepository, name: &str) -> Result<bool, OxenError> {
-    with_ref_manager(repo, |manager| {
-        if let Some(branch_commit_id) = manager.get_commit_id_for_branch(name)? {
-            if let Some(commit_id) = manager.head_commit_id()? {
+    with_ref_reader(repo, |reader| {
+        if let Some(branch_commit_id) = reader.get_commit_id_for_branch(name)? {
+            if let Some(commit_id) = reader.head_commit_id()? {
                 let history = repositories::commits::list_from(repo, &commit_id)?;
                 for commit in history.iter() {
                     if commit.id == branch_commit_id {

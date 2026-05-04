@@ -76,6 +76,8 @@ pub fn status_from_dir(
 
 #[cfg(test)]
 mod tests {
+    use crate::constants::{MERGE_DIR, REFS_DIR};
+    use crate::core;
     use crate::error::OxenError;
     use crate::model::StagedEntryStatus;
     use crate::model::staged_data::StagedDataOpts;
@@ -87,8 +89,87 @@ mod tests {
     use crate::util;
 
     use std::collections::HashSet;
+    use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RefFileSnapshot {
+        path: PathBuf,
+        len: u64,
+        modified: Option<SystemTime>,
+    }
+
+    fn refs_file_snapshot(
+        repo: &crate::model::LocalRepository,
+    ) -> Result<Vec<RefFileSnapshot>, OxenError> {
+        fn collect(
+            root: &Path,
+            dir: &Path,
+            snapshots: &mut Vec<RefFileSnapshot>,
+        ) -> Result<(), OxenError> {
+            if !dir.exists() {
+                return Ok(());
+            }
+
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+
+                if metadata.is_dir() {
+                    collect(root, &path, snapshots)?;
+                } else {
+                    snapshots.push(RefFileSnapshot {
+                        path: util::fs::path_relative_to_dir(&path, root)?,
+                        len: metadata.len(),
+                        modified: metadata.modified().ok(),
+                    });
+                }
+            }
+
+            Ok(())
+        }
+
+        let refs_dir = util::fs::oxen_hidden_dir(&repo.path).join(REFS_DIR);
+        let mut snapshots = Vec::new();
+        collect(&refs_dir, &refs_dir, &mut snapshots)?;
+        snapshots.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(snapshots)
+    }
+
+    #[tokio::test]
+    async fn test_status_does_not_mutate_refs_metadata() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            core::refs::remove_from_cache(&repo.path)?;
+            let before = refs_file_snapshot(&repo)?;
+
+            let status = repositories::status(&repo)?;
+            assert!(status.is_clean());
+
+            let after = refs_file_snapshot(&repo)?;
+            assert_eq!(before, after);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_status_does_not_create_merge_conflict_db() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let merge_dir = util::fs::oxen_hidden_dir(&repo.path).join(MERGE_DIR);
+            assert!(!merge_dir.exists());
+
+            let status = repositories::status(&repo)?;
+            assert!(status.is_clean());
+            assert!(!merge_dir.exists());
+
+            Ok(())
+        })
+        .await
+    }
 
     #[tokio::test]
     async fn test_command_status_empty() -> Result<(), OxenError> {
