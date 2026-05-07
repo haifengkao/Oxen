@@ -3,32 +3,22 @@ use crate::model::diff::change_type::ChangeType;
 use crate::model::diff::text_diff::LineDiff;
 use crate::model::diff::text_diff::TextDiff;
 
-use difference::{Changeset, Difference};
+use similar::{Algorithm, ChangeTag, TextDiff as SimilarTextDiff};
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// Adds a slice of lines from a text block to the result vector with a given modification type.
-fn add_lines_to_diff(
-    result: &mut TextDiff,
-    text_block: &str,
-    modification: ChangeType,
-    lines_to_take: Option<(usize, usize)>,
-) {
-    let lines: Vec<&str> = text_block.split('\n').collect();
-    let (start, end) = lines_to_take.unwrap_or((0, lines.len()));
+const CONTEXT_LINES: usize = 3;
+const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
 
-    // Ensure start and end are within bounds
-    let start = start.min(lines.len());
-    let end = end.min(lines.len());
-
-    if start >= end {
-        return;
-    }
-
-    for line in &lines[start..end] {
-        result.lines.push(LineDiff {
-            modification,
-            text: line.to_string(),
-        });
+fn strip_line_ending(line: &str) -> &str {
+    if let Some(line) = line.strip_suffix("\r\n") {
+        line
+    } else if let Some(line) = line.strip_suffix('\n') {
+        line
+    } else if let Some(line) = line.strip_suffix('\r') {
+        line
+    } else {
+        line
     }
 }
 
@@ -51,93 +41,36 @@ pub fn diff(
     let original_data = original_data.unwrap_or_default();
     let compare_data = compare_data.unwrap_or_default();
 
-    let Changeset { diffs, .. } = Changeset::new(&original_data, &compare_data, "\n");
-    log::debug!("Changeset created with {} diffs", diffs.len());
+    let diff = SimilarTextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(&original_data, &compare_data);
 
-    // Find the indices of all Add or Rem changes
-    let change_indices: Vec<usize> = diffs
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| !matches!(d, Difference::Same(_)))
-        .map(|(i, _)| i)
-        .collect();
-
-    // If there are no changes, return an empty diff
-    if change_indices.is_empty() {
+    if diff.ratio() == 1.0 {
         log::debug!("No changes detected, returning empty TextDiff.");
         return Ok(result);
     }
 
-    let mut last_processed_diff_idx: i32 = -1;
-    let mut post_context_lines_from_prev_chunk = 0;
-    let mut is_first_chunk = true;
-
-    for &change_idx in &change_indices {
-        if (change_idx as i32) <= last_processed_diff_idx {
-            continue;
-        }
-        log::debug!("Processing change at index: {change_idx}");
-
-        if !is_first_chunk {
+    for (idx, group) in diff.grouped_ops(CONTEXT_LINES).iter().enumerate() {
+        if idx > 0 {
             result.lines.push(LineDiff {
                 modification: ChangeType::Unchanged,
                 text: "...".to_string(),
             });
         }
-        is_first_chunk = false;
 
-        let context_diff_idx = change_idx.saturating_sub(1);
-        let mut pre_context_lines_to_skip = 0;
-
-        if (context_diff_idx as i32) == last_processed_diff_idx {
-            pre_context_lines_to_skip = post_context_lines_from_prev_chunk;
-        }
-
-        if change_idx > 0
-            && let Some(Difference::Same(text)) = diffs.get(context_diff_idx)
-        {
-            let lines: Vec<_> = text.split('\n').collect();
-            let desired_start = lines.len().saturating_sub(3);
-            let actual_start = desired_start.max(pre_context_lines_to_skip);
-            log::debug!(
-                "Adding pre-context from diff [{context_diff_idx}], lines [{actual_start}..]"
-            );
-            add_lines_to_diff(
-                &mut result,
-                text,
-                ChangeType::Unchanged,
-                Some((actual_start, lines.len())),
-            );
-        }
-        post_context_lines_from_prev_chunk = 0;
-
-        let mut current_idx = change_idx;
-        while let Some(diff) = diffs.get(current_idx) {
-            match diff {
-                Difference::Add(text) => {
-                    log::debug!("Adding Added block at index {current_idx}");
-                    add_lines_to_diff(&mut result, text, ChangeType::Added, None);
-                }
-                Difference::Rem(text) => {
-                    log::debug!("Adding Removed block at index {current_idx}");
-                    add_lines_to_diff(&mut result, text, ChangeType::Removed, None);
-                }
-                Difference::Same(_) => {
-                    break;
-                }
+        for op in group {
+            for change in diff.iter_changes(op) {
+                let modification = match change.tag() {
+                    ChangeTag::Equal => ChangeType::Unchanged,
+                    ChangeTag::Delete => ChangeType::Removed,
+                    ChangeTag::Insert => ChangeType::Added,
+                };
+                result.lines.push(LineDiff {
+                    modification,
+                    text: strip_line_ending(change.value()).to_string(),
+                });
             }
-            last_processed_diff_idx = current_idx as i32;
-            current_idx += 1;
-        }
-
-        if let Some(Difference::Same(text)) = diffs.get(current_idx) {
-            let lines: Vec<_> = text.split('\n').collect();
-            let count = 2.min(lines.len());
-            log::debug!("Adding post-context from diff [{current_idx}], lines [..{count}]");
-            add_lines_to_diff(&mut result, text, ChangeType::Unchanged, Some((0, count)));
-
-            last_processed_diff_idx = current_idx as i32;
-            post_context_lines_from_prev_chunk = count;
         }
     }
 
@@ -146,4 +79,42 @@ pub fn diff(
         result.lines.len()
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn large_shifted_text_diff_returns_without_timing_out() {
+        let mut original = String::new();
+        let mut compare = String::new();
+
+        for idx in 0..20_000 {
+            original.push_str(&format!("line-{idx}\n"));
+            compare.push_str(&format!("line-{}\n", idx + 1));
+        }
+        compare.push_str("tail\n");
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let diff = diff(Some(original), None, Some(compare), None);
+            tx.send(diff).expect("test receiver should still be open");
+        });
+
+        let diff = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("large text diff should not hang or exhaust memory")
+            .expect("large text diff should succeed");
+
+        assert!(
+            diff.lines
+                .iter()
+                .any(|line| line.modification == ChangeType::Added && line.text == "tail"),
+            "diff should include the inserted tail line"
+        );
+    }
 }
