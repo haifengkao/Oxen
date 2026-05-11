@@ -145,7 +145,7 @@ mod tests {
             core::refs::remove_from_cache(&repo.path)?;
             let before = refs_file_snapshot(&repo)?;
 
-            let status = repositories::status(&repo)?;
+            let status = repositories::status(&repo).await?;
             assert!(status.is_clean());
 
             let after = refs_file_snapshot(&repo)?;
@@ -162,7 +162,7 @@ mod tests {
             let merge_dir = util::fs::oxen_hidden_dir(&repo.path).join(MERGE_DIR);
             assert!(!merge_dir.exists());
 
-            let status = repositories::status(&repo)?;
+            let status = repositories::status(&repo).await?;
             assert!(status.is_clean());
             assert!(!merge_dir.exists());
 
@@ -640,7 +640,7 @@ mod tests {
             util::fs::remove_file(og_file)?;
 
             let opts = StagedDataOpts::from_paths(&[repo.path.join(&og_basename)]);
-            let status = repositories::status::status_from_opts(&repo, &opts)?;
+            let status = repositories::status::status_from_opts(&repo, &opts).await?;
             status.print();
 
             assert_eq!(status.removed_files.len(), 1);

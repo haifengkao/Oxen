@@ -94,7 +94,7 @@ impl RunCmd for StatusCmd {
         let paths = if paths.is_empty() {
             vec![repository.path.clone()]
         } else {
-            parse_status_paths(&repository, &paths)?
+            parse_status_paths(&repository, &paths).await?
         };
 
         let is_remote = false;
@@ -142,7 +142,7 @@ impl RunCmd for StatusCmd {
     }
 }
 
-fn parse_status_paths(
+async fn parse_status_paths(
     repository: &LocalRepository,
     paths: &[PathBuf],
 ) -> Result<Vec<PathBuf>, OxenError> {
@@ -159,7 +159,7 @@ fn parse_status_paths(
     };
     let head_commit = repositories::commits::head_commit_maybe(repository)?;
 
-    let expanded_paths = util::glob::parse_glob_paths(&glob_opts, Some(repository))?;
+    let expanded_paths = util::glob::parse_glob_paths(&glob_opts, Some(repository)).await?;
     let mut parsed_paths: Vec<PathBuf> = Vec::new();
 
     let mut filtered_existing: Vec<PathBuf> = expanded_paths
@@ -462,8 +462,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn parse_status_paths_skips_unmatched_inputs() -> Result<(), OxenError> {
+    #[tokio::test]
+    async fn parse_status_paths_skips_unmatched_inputs() -> Result<(), OxenError> {
         let temp_dir = TempDir::new()?;
         let repo = repositories::init(temp_dir.path())?;
 
@@ -471,25 +471,26 @@ mod tests {
         util::fs::write_to_path(repo.path.join(&tracked_path), "hello\n")?;
 
         // Existing path should be kept.
-        let parsed_existing = parse_status_paths(&repo, std::slice::from_ref(&tracked_path))?;
+        let parsed_existing =
+            parse_status_paths(&repo, std::slice::from_ref(&tracked_path)).await?;
         assert_eq!(parsed_existing, vec![repo.path.join(&tracked_path)]);
 
         // Wildcard that matches nothing should produce no paths so `oxen status` only
         // evaluates an empty scope, matching git-style behavior.
         let parsed_missing_wildcard =
-            parse_status_paths(&repo, &[PathBuf::from("*/missing-site.yml")])?;
+            parse_status_paths(&repo, &[PathBuf::from("*/missing-site.yml")]).await?;
         assert!(parsed_missing_wildcard.is_empty());
 
         // Non-wildcard path that does not exist should also be skipped, unless tracked.
         let parsed_missing_literal =
-            parse_status_paths(&repo, &[PathBuf::from("does_not_exist.yml")])?;
+            parse_status_paths(&repo, &[PathBuf::from("does_not_exist.yml")]).await?;
         assert!(parsed_missing_literal.is_empty());
 
         let opts = StagedDataOpts {
             paths: parsed_missing_literal,
             ..StagedDataOpts::default()
         };
-        let repo_status = repositories::status::status_from_opts(&repo, &opts)?;
+        let repo_status = repositories::status::status_from_opts(&repo, &opts).await?;
         assert!(repo_status.is_clean());
 
         Ok(())

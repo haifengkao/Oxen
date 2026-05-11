@@ -123,10 +123,12 @@ pub async fn drop_paths(
 
             let working_path = repo.path.join(&file_path);
             if working_path.exists() {
-                if util::fs::is_modified_from_node_with_metadata(
+                let metadata = util::fs::metadata(&working_path)?;
+                if util::fs::classify_modified_from_node_with_metadata(
                     &working_path,
                     &file_node,
-                    util::fs::metadata(&working_path),
+                    &metadata,
+                    false,
                 )? {
                     return Err(OxenError::basic_str(format!(
                         "Refusing to drop modified file {}",
@@ -184,13 +186,15 @@ pub async fn get_paths(
 
         for (file_path, file_node) in files {
             let working_path = repo.path.join(&file_path);
-            if working_path.exists()
-                && util::fs::is_modified_from_node_with_metadata(
+            if working_path.exists() && {
+                let metadata = util::fs::metadata(&working_path)?;
+                util::fs::classify_modified_from_node_with_metadata(
                     &working_path,
                     &file_node,
-                    util::fs::metadata(&working_path),
+                    &metadata,
+                    false,
                 )?
-            {
+            } {
                 return Err(OxenError::basic_str(format!(
                     "Refusing to overwrite modified file {}",
                     file_path.display()
@@ -329,13 +333,13 @@ mod tests {
             let dropped = drop_paths(&repo, std::slice::from_ref(&relative_path)).await?;
             assert_eq!(dropped.len(), 1);
             assert!(!file_path.exists());
-            assert!(repositories::status(&repo)?.is_clean());
+            assert!(repositories::status(&repo).await?.is_clean());
             assert_eq!(list(&repo)?.len(), 1);
 
             let restored = get_paths(&repo, std::slice::from_ref(&relative_path)).await?;
             assert_eq!(restored.len(), 1);
             assert_eq!(util::fs::read_from_path(&file_path)?, "hello offline");
-            assert!(repositories::status(&repo)?.is_clean());
+            assert!(repositories::status(&repo).await?.is_clean());
             assert!(list(&repo)?.is_empty());
 
             Ok(())
@@ -382,7 +386,7 @@ mod tests {
             assert_eq!(dropped.len(), 2);
             assert!(!first.exists());
             assert!(!second.exists());
-            assert!(repositories::status(&repo)?.is_clean());
+            assert!(repositories::status(&repo).await?.is_clean());
 
             Ok(())
         })

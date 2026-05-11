@@ -13,7 +13,6 @@ use crate::core::db::key_val::{opts, str_val_db};
 use crate::core::db::merkle_node::MerkleNodeDB;
 use crate::core::refs::{with_ref_manager, with_ref_reader};
 use crate::core::v_latest::index::CommitMerkleTree;
-use crate::core::refs::{with_ref_manager, with_ref_reader};
 use crate::error::OxenError;
 use crate::model::merkle_tree::node::commit_node::CommitNodeOpts;
 use crate::model::merkle_tree::node::dir_node::DirNodeOpts;

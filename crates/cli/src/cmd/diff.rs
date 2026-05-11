@@ -115,7 +115,7 @@ impl RunCmd for DiffCmd {
             let repo = LocalRepository::from_current_dir()?;
             let path = status_path_for_name_status(&repo, &opts.path_1);
             let status_opts = StagedDataOpts::from_paths(&[path]);
-            let status = repositories::status::status_from_opts(&repo, &status_opts)?;
+            let status = repositories::status::status_from_opts(&repo, &status_opts).await?;
 
             if args.get_flag("json") {
                 println!(

@@ -29,11 +29,11 @@ use crate::model::merkle_tree::node::EMerkleTreeNode;
 use crate::model::merkle_tree::node::MerkleTreeNode;
 use crate::repositories::offline::OfflineIndex;
 
-pub fn status(repo: &LocalRepository) -> Result<StagedData, OxenError> {
-    status_from_dir(repo, &repo.path)
+pub async fn status(repo: &LocalRepository) -> Result<StagedData, OxenError> {
+    status_from_dir(repo, &repo.path).await
 }
 
-pub fn status_from_dir(
+pub async fn status_from_dir(
     repo: &LocalRepository,
     dir: impl AsRef<Path>,
 ) -> Result<StagedData, OxenError> {
@@ -41,10 +41,10 @@ pub fn status_from_dir(
         paths: vec![dir.as_ref().to_path_buf()],
         ..StagedDataOpts::default()
     };
-    status_from_opts(repo, &opts)
+    status_from_opts(repo, &opts).await
 }
 
-pub fn status_from_opts(
+pub async fn status_from_opts(
     repo: &LocalRepository,
     opts: &StagedDataOpts,
 ) -> Result<StagedData, OxenError> {
@@ -496,7 +496,7 @@ fn find_changes(
         return Ok((untracked, modified, removed));
     }
 
-    let mut entries: Vec<(PathBuf, bool, Result<std::fs::Metadata, OxenError>)> = Vec::new();
+    let mut entries: Vec<(PathBuf, bool, std::fs::Metadata)> = Vec::new();
     if is_dir {
         let Ok(dir_entries) = std::fs::read_dir(&full_path) else {
             return Err(OxenError::basic_str(format!(
@@ -510,8 +510,11 @@ fn find_changes(
                     let path = entry.path();
                     let is_dir = path.is_dir();
                     let md = match entry.metadata() {
-                        Ok(md) => Ok(md),
-                        Err(err) => Err(OxenError::basic_str(err.to_string())),
+                        Ok(md) => md,
+                        Err(err) => {
+                            log::debug!("Skipping entry with unreadable metadata {path:?}: {err}");
+                            return None;
+                        }
                     };
                     Some((path, is_dir, md))
                 }
@@ -523,7 +526,7 @@ fn find_changes(
             .collect();
         entries.extend(new_entries);
     } else {
-        let metadata = util::fs::metadata(&full_path);
+        let metadata = util::fs::metadata(&full_path)?;
         entries.push((full_path.to_owned(), false, metadata));
     }
     let mut untracked_count = 0;
@@ -563,8 +566,9 @@ fn find_changes(
             // Either way, we know the directory is not all_untracked
             untracked.all_untracked = false;
             if let EMerkleTreeNode::File(file_node) = &node.node {
-                let is_modified =
-                    util::fs::is_modified_from_node_with_metadata(&path, file_node, metadata)?;
+                let is_modified = util::fs::classify_modified_from_node_with_metadata(
+                    &path, file_node, &metadata, false,
+                )?;
                 log::debug!("is_modified {is_modified} {relative_path:?}");
                 if is_modified {
                     modified.insert(relative_path.clone());
@@ -579,7 +583,9 @@ fn find_changes(
                 && let EMerkleTreeNode::File(file_node) = &search_node.node
             {
                 found_file = true;
-                if util::fs::is_modified_from_node_with_metadata(&path, file_node, metadata)? {
+                if util::fs::classify_modified_from_node_with_metadata(
+                    &path, file_node, &metadata, false,
+                )? {
                     modified.insert(relative_path.clone());
                 }
             }
@@ -756,7 +762,7 @@ fn find_local_changes(
     let search_node = maybe_get_node(repo, dir_hashes, search_node_path)?;
     let dir_children = maybe_get_dir_children(&search_node)?;
 
-    for (path, is_dir, _) in entries {
+    for (path, is_dir, metadata) in entries {
         progress.set_message(format!(
             "🐂 checking ({total_entries} files) scanning {search_node_path:?}"
         ));
@@ -791,7 +797,9 @@ fn find_local_changes(
             // Either way, we know the directory is not all_untracked
             untracked.all_untracked = false;
             if let EMerkleTreeNode::File(file_node) = &node.node {
-                let is_modified = util::fs::is_modified_from_node(&path, file_node)?;
+                let is_modified = util::fs::classify_modified_from_node_with_metadata(
+                    &path, file_node, &metadata, false,
+                )?;
                 log::debug!("is_modified {is_modified} {relative_path:?}");
                 if is_modified {
                     modified.insert(relative_path.clone());
@@ -806,7 +814,9 @@ fn find_local_changes(
                 && let EMerkleTreeNode::File(file_node) = &search_node.node
             {
                 found_file = true;
-                if util::fs::is_modified_from_node(&path, file_node)? {
+                if util::fs::classify_modified_from_node_with_metadata(
+                    &path, file_node, &metadata, false,
+                )? {
                     modified.insert(relative_path.clone());
                 }
             }
