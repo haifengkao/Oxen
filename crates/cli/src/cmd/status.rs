@@ -6,7 +6,9 @@ use liboxen::core::oxenignore;
 use liboxen::error::OxenError;
 use liboxen::model::staged_data::StagedDataOpts;
 use liboxen::model::{Branch, Commit, LocalRepository, StagedData, StagedEntryStatus};
+use liboxen::opts::GlobOpts;
 use liboxen::repositories;
+use liboxen::util;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -85,10 +87,16 @@ impl RunCmd for StatusCmd {
         let repository = LocalRepository::from_current_dir()?;
         check_repo_migration_needed(&repository)?;
 
-        let paths = args
+        let paths: Vec<PathBuf> = args
             .get_many::<String>("paths")
-            .map(|vals| vals.map(|v| repository.path.join(v)).collect())
-            .unwrap_or_else(|| vec![repository.path.clone()]);
+            .map(|vals| vals.map(PathBuf::from).collect())
+            .unwrap_or_default();
+        let paths = if paths.is_empty() {
+            vec![repository.path.clone()]
+        } else {
+            parse_status_paths(&repository, &paths)?
+        };
+
         let is_remote = false;
         let opts = StagedDataOpts {
             paths,
@@ -132,6 +140,51 @@ impl RunCmd for StatusCmd {
 
         Ok(())
     }
+}
+
+fn parse_status_paths(
+    repository: &LocalRepository,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, OxenError> {
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| repository.path.join(path))
+        .collect();
+    let glob_opts = GlobOpts {
+        paths,
+        staged_db: false,
+        merkle_tree: true,
+        working_dir: true,
+        walk_dirs: false,
+    };
+    let head_commit = repositories::commits::head_commit_maybe(repository)?;
+
+    let expanded_paths = util::glob::parse_glob_paths(&glob_opts, Some(repository))?;
+    let mut parsed_paths: Vec<PathBuf> = Vec::new();
+
+    let mut filtered_existing: Vec<PathBuf> = expanded_paths
+        .iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect();
+    parsed_paths.append(&mut filtered_existing);
+
+    if let Some(commit) = head_commit {
+        for path in expanded_paths.iter() {
+            if path.exists() {
+                continue;
+            }
+            let path_in_repo = util::fs::path_relative_to_dir(path, &repository.path)?;
+            if repositories::tree::get_node_by_path(repository, &commit, &path_in_repo)?.is_some() {
+                parsed_paths.push(path.clone());
+            }
+        }
+    }
+
+    parsed_paths.sort();
+    parsed_paths.dedup();
+
+    Ok(parsed_paths)
 }
 
 async fn status_json_value(
@@ -405,6 +458,39 @@ mod tests {
                 }
             ])
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_status_paths_skips_unmatched_inputs() -> Result<(), OxenError> {
+        let temp_dir = TempDir::new()?;
+        let repo = repositories::init(temp_dir.path())?;
+
+        let tracked_path = PathBuf::from("nested/site.yml");
+        util::fs::write_to_path(repo.path.join(&tracked_path), "hello\n")?;
+
+        // Existing path should be kept.
+        let parsed_existing = parse_status_paths(&repo, std::slice::from_ref(&tracked_path))?;
+        assert_eq!(parsed_existing, vec![repo.path.join(&tracked_path)]);
+
+        // Wildcard that matches nothing should produce no paths so `oxen status` only
+        // evaluates an empty scope, matching git-style behavior.
+        let parsed_missing_wildcard =
+            parse_status_paths(&repo, &[PathBuf::from("*/missing-site.yml")])?;
+        assert!(parsed_missing_wildcard.is_empty());
+
+        // Non-wildcard path that does not exist should also be skipped, unless tracked.
+        let parsed_missing_literal =
+            parse_status_paths(&repo, &[PathBuf::from("does_not_exist.yml")])?;
+        assert!(parsed_missing_literal.is_empty());
+
+        let opts = StagedDataOpts {
+            paths: parsed_missing_literal,
+            ..StagedDataOpts::default()
+        };
+        let repo_status = repositories::status::status_from_opts(&repo, &opts)?;
+        assert!(repo_status.is_clean());
 
         Ok(())
     }
