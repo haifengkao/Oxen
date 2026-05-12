@@ -3,16 +3,27 @@ use clap::{Arg, ArgMatches, Command};
 use colored::Colorize;
 use minus::Pager;
 use std::fmt::Write;
+use std::path::PathBuf;
 use time::format_description;
 use time::format_description::well_known::Rfc3339;
 
 use liboxen::error::OxenError;
 use liboxen::model::{Commit, LocalRepository};
+use liboxen::opts::PaginateOpts;
 use liboxen::repositories;
 
 use crate::cmd::RunCmd;
 pub const NAME: &str = "log";
 pub struct LogCmd;
+
+struct LogOptions {
+    revision: Option<String>,
+    skip: usize,
+    num_commits: usize,
+    as_json: bool,
+    no_count_cache: bool,
+    path: Option<PathBuf>,
+}
 
 fn write_to_pager(output: &mut Pager, text: &str) -> Result<(), OxenError> {
     writeln!(output, "{text}")
@@ -59,6 +70,12 @@ impl RunCmd for LogCmd {
                     .help("Do not read or write the commit count cache while listing history.")
                     .action(clap::ArgAction::SetTrue),
             )
+            .arg(
+                Arg::new("pathspec")
+                    .help("Limit history to commits that changed this file or directory.")
+                    .num_args(0..=1)
+                    .value_name("path"),
+            )
     }
 
     async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
@@ -75,16 +92,15 @@ impl RunCmd for LogCmd {
             .expect("Must supply skip")
             .parse::<usize>()
             .expect("skip must be a valid integer.");
-        let revision = args.get_one::<String>("revision").map(String::from);
-        self.log_commits(
-            &repo,
-            revision,
+        let opts = LogOptions {
+            revision: args.get_one::<String>("revision").map(String::from),
             skip,
             num_commits,
-            args.get_flag("json"),
-            args.get_flag("no_count_cache"),
-        )
-        .await?;
+            as_json: args.get_flag("json"),
+            no_count_cache: args.get_flag("no_count_cache"),
+            path: args.get_one::<String>("pathspec").map(PathBuf::from),
+        };
+        self.log_commits(&repo, opts).await?;
 
         Ok(())
     }
@@ -111,35 +127,10 @@ fn log_json_value(commits: &[Commit]) -> serde_json::Value {
 }
 
 impl LogCmd {
-    pub async fn log_commits(
-        &self,
-        repo: &LocalRepository,
-        revision: Option<String>,
-        skip: usize,
-        num_commits: usize,
-        as_json: bool,
-        no_count_cache: bool,
-    ) -> Result<(), OxenError> {
-        let revision = match revision {
-            Some(revision) => revision,
-            None => repositories::commits::head_commit(repo)?.id,
-        };
-        let commits = if no_count_cache {
-            repositories::commits::list_from_without_count_cache(
-                repo,
-                &revision,
-                skip,
-                num_commits,
-            )?
-        } else {
-            repositories::commits::list_from(repo, &revision)?
-                .into_iter()
-                .skip(skip)
-                .take(num_commits)
-                .collect()
-        };
+    async fn log_commits(&self, repo: &LocalRepository, opts: LogOptions) -> Result<(), OxenError> {
+        let commits = self.resolve_commits(repo, &opts)?;
 
-        if as_json {
+        if opts.as_json {
             println!("{}", serde_json::to_string(&log_json_value(&commits))?);
             return Ok(());
         }
@@ -169,6 +160,52 @@ impl LogCmd {
             }
         }
         Ok(())
+    }
+
+    fn resolve_commits(
+        &self,
+        repo: &LocalRepository,
+        opts: &LogOptions,
+    ) -> Result<Vec<Commit>, OxenError> {
+        let revision = match &opts.revision {
+            Some(revision) => revision.clone(),
+            None => repositories::commits::head_commit(repo)?.id,
+        };
+
+        if let Some(path) = &opts.path {
+            let commit = repositories::commits::get_commit_or_head(repo, Some(revision))?;
+            let page_size = opts.skip.saturating_add(opts.num_commits).max(1);
+            let paginated = repositories::commits::list_by_path_from_paginated(
+                repo,
+                &commit,
+                path,
+                PaginateOpts {
+                    page_num: 1,
+                    page_size,
+                },
+            )?;
+            return Ok(paginated
+                .commits
+                .into_iter()
+                .skip(opts.skip)
+                .take(opts.num_commits)
+                .collect());
+        }
+
+        if opts.no_count_cache {
+            repositories::commits::list_from_without_count_cache(
+                repo,
+                &revision,
+                opts.skip,
+                opts.num_commits,
+            )
+        } else {
+            Ok(repositories::commits::list_from(repo, &revision)?
+                .into_iter()
+                .skip(opts.skip)
+                .take(opts.num_commits)
+                .collect())
+        }
     }
 }
 
@@ -225,7 +262,17 @@ mod tests {
             assert!(!commit_count_dir.exists());
 
             LogCmd
-                .log_commits(&repo, Some("main".to_string()), 0, 2, true, true)
+                .log_commits(
+                    &repo,
+                    LogOptions {
+                        revision: Some("main".to_string()),
+                        skip: 0,
+                        num_commits: 2,
+                        as_json: true,
+                        no_count_cache: true,
+                        path: None,
+                    },
+                )
                 .await?;
 
             assert!(!commit_count_dir.exists());
@@ -233,5 +280,76 @@ mod tests {
             Ok(())
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn log_commits_can_filter_history_by_path() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let target_path = repo.path.join("target.txt");
+            util::fs::write_to_path(&target_path, "first")?;
+            repositories::add(&repo, &target_path).await?;
+            let first_target_commit = repositories::commit(&repo, "add target")?;
+
+            let other_path = repo.path.join("other.txt");
+            util::fs::write_to_path(&other_path, "other")?;
+            repositories::add(&repo, &other_path).await?;
+            repositories::commit(&repo, "add other")?;
+
+            util::fs::write_to_path(&target_path, "second")?;
+            repositories::add(&repo, &target_path).await?;
+            let second_target_commit = repositories::commit(&repo, "modify target")?;
+
+            let commits = LogCmd.resolve_commits(
+                &repo,
+                &LogOptions {
+                    revision: Some("main".to_string()),
+                    skip: 0,
+                    num_commits: 10,
+                    as_json: true,
+                    no_count_cache: true,
+                    path: Some(PathBuf::from("target.txt")),
+                },
+            )?;
+
+            assert_eq!(
+                commits
+                    .iter()
+                    .map(|commit| commit.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    second_target_commit.id.as_str(),
+                    first_target_commit.id.as_str()
+                ]
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[test]
+    fn log_args_accept_git_style_pathspec_after_separator() {
+        let args = LogCmd
+            .args()
+            .try_get_matches_from(["log", "--json", "--", "target.txt"])
+            .unwrap();
+        let paths = args
+            .get_many::<String>("pathspec")
+            .unwrap()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["target.txt"]);
+    }
+
+    #[test]
+    fn log_args_accept_git_style_pathspec_without_separator() {
+        let args = LogCmd
+            .args()
+            .try_get_matches_from(["log", "--json", "target.txt"])
+            .unwrap();
+        let path = args.get_one::<String>("pathspec").unwrap();
+
+        assert_eq!(path, "target.txt");
     }
 }
