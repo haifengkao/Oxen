@@ -5397,6 +5397,7 @@ dependencies = [
  "log",
  "minus",
  "serde_json",
+ "similar",
  "tempfile",
  "time",
  "tokio",

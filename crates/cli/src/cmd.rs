@@ -9,6 +9,9 @@ pub use add::AddCmd;
 pub mod branch;
 pub use branch::BranchCmd;
 
+pub mod blame;
+pub use blame::BlameCmd;
+
 pub mod checkout;
 pub use checkout::CheckoutCmd;
 

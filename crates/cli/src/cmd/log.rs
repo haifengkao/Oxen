@@ -193,19 +193,29 @@ impl LogCmd {
         }
 
         if opts.no_count_cache {
-            repositories::commits::list_from_without_count_cache(
+            return repositories::commits::list_from_without_count_cache(
                 repo,
                 &revision,
                 opts.skip,
                 opts.num_commits,
-            )
-        } else {
-            Ok(repositories::commits::list_from(repo, &revision)?
-                .into_iter()
-                .skip(opts.skip)
-                .take(opts.num_commits)
-                .collect())
+            );
         }
+
+        let page_size = opts.skip.saturating_add(opts.num_commits).max(1);
+        let paginated = repositories::commits::list_from_paginated(
+            repo,
+            &revision,
+            PaginateOpts {
+                page_num: 1,
+                page_size,
+            },
+        )?;
+        Ok(paginated
+            .commits
+            .into_iter()
+            .skip(opts.skip)
+            .take(opts.num_commits)
+            .collect())
     }
 }
 
