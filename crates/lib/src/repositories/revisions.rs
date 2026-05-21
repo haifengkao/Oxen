@@ -53,7 +53,7 @@ pub async fn get_version_stream_from_revision(
     let file_node = repositories::tree::get_file_by_path(repo, &commit, path)?
         .ok_or_else(|| OxenError::entry_does_not_exist_in_commit(path, &commit.id))?;
 
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     version_store
         .get_version_stream(&file_node.hash().to_string())
         .await

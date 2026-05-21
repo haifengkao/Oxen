@@ -237,7 +237,7 @@ pub async fn download_entries_to_repo(
             download_file(remote_repo, &entry, &remote_path, &local_path, revision).await?;
 
             // Save contents to version store
-            let version_store = local_repo.version_store()?;
+            let version_store = local_repo.version_store();
 
             let file_bytes = tokio::fs::read(local_path).await?;
             let hash = util::hasher::hash_buffer(&file_bytes);
@@ -336,7 +336,7 @@ pub async fn pull_large_entry(
     let num_chunks = total_size.div_ceil(chunk_size) as usize;
     let hash = commit_entry.hash.clone();
     let revision = commit_entry.commit_id.clone();
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
 
     let remote_path = remote_path.as_ref();
 
@@ -803,7 +803,10 @@ pub async fn download_data_from_version_paths(
     while num_retries < total_retries {
         match try_download_data_from_version_paths(remote_repo, content_ids, &dst).await {
             Ok(val) => return Ok(val),
-            Err(OxenError::Authentication(val)) => return Err(OxenError::Authentication(val)),
+            // Short-circuit on errors that won't change on retry (auth failures, 4xx
+            // responses, server-confirmed missing blobs). Without this, a doomed pull
+            // pays the full exponential backoff before surfacing the diagnostic.
+            Err(err) if err.is_fatal_for_retry() => return Err(err),
             Err(err) => {
                 num_retries += 1;
                 // Exponentially back off

@@ -303,32 +303,140 @@ where
     Ok(())
 }
 
-pub fn run_empty_local_repo_test_w_version<T>(
-    version: MinOxenVersion,
-    test: T,
-) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository) -> Result<(), OxenError> + std::panic::UnwindSafe,
-{
-    init_test_env();
-    log::info!("<<<<< run_empty_local_repo_test start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let repo = repositories::init::init_with_version(&repo_dir, version)?;
+/// RAII cleanup for a test repo directory. Dropping the guard removes the
+/// directory via [`maybe_cleanup_repo`] (errors are swallowed since `Drop`
+/// can't surface them). The same call runs on the normal-exit path *and*
+/// during panic unwind.
+#[cfg(test)]
+pub struct RepoDirGuard {
+    repo_dir: PathBuf,
+}
 
-    log::info!(">>>>> run_empty_local_repo_test running test");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match test(repo) {
-        Ok(_) => {}
-        Err(err) => {
-            panic!("Error running test. Err: {err}");
+#[cfg(test)]
+impl RepoDirGuard {
+    pub fn new(repo_dir: PathBuf) -> Self {
+        Self { repo_dir }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.repo_dir
+    }
+}
+
+#[cfg(test)]
+impl Drop for RepoDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = maybe_cleanup_repo(&self.repo_dir) {
+            log::warn!("RepoDirGuard cleanup failed for {:?}: {e}", self.repo_dir);
         }
-    }));
+    }
+}
 
-    // Remove repo dir
-    maybe_cleanup_repo(&repo_dir)?;
+/// RAII handle to a freshly-initialized test [`LocalRepository`]. Derefs to
+/// the inner `LocalRepository` so callers can use it as one transparently.
+///
+/// Drop order matters: `repo` is declared before `_guard` so that on drop
+/// the inner `LocalRepository` (and any resources it holds, like an LMDB
+/// `heed::Env`) is released *before* the [`RepoDirGuard`] removes the
+/// on-disk repo directory.
+#[cfg(test)]
+pub struct TestLocalRepo {
+    repo: Option<LocalRepository>,
+    _guard: RepoDirGuard,
+}
 
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result.is_ok());
-    Ok(())
+#[cfg(test)]
+impl TestLocalRepo {
+    pub fn new(repo: LocalRepository) -> Self {
+        let repo_dir = repo.path.clone();
+        Self {
+            repo: Some(repo),
+            _guard: RepoDirGuard::new(repo_dir),
+        }
+    }
+
+    /// Drop the inner [`LocalRepository`] (e.g. to release an LMDB env)
+    /// while keeping the on-disk repo dir alive for further reads. The
+    /// directory itself is still removed when this handle is dropped.
+    pub fn drop_inner(&mut self) {
+        self.repo.take();
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestLocalRepo {
+    type Target = LocalRepository;
+    fn deref(&self) -> &Self::Target {
+        self.repo
+            .as_ref()
+            .expect("TestLocalRepo inner LocalRepository was already dropped via drop_inner")
+    }
+}
+
+/// Base directory under which LMDB-backed test repos are rooted.
+///
+/// LMDB depends on NT memory-section APIs that are not implemented by
+/// virtual filesystems. On Windows CI `OXEN_TEST_RUN_DIR=R:\test` is an
+/// ImDisk RAMDisk (a VFS) and opening an LMDB env there fails with
+/// `Os { code: 1, .. }` → "Incorrect function." Routing LMDB-backed test
+/// repos to the OS temp dir keeps the env on the host's real volume
+/// (NTFS on Windows runners). Mirrors `lmdb_test_root` in
+/// `crates/lib/src/core/db/merkle_node/lmdb.rs`, used by the low-level
+/// `LmdbBackend` tests.
+#[cfg(test)]
+fn lmdb_test_base() -> PathBuf {
+    std::env::temp_dir().join("oxen-lmdb-tests")
+}
+
+/// Create a fresh empty dir suitable for an LMDB-backed test repo and
+/// return a [`RepoDirGuard`] that removes it on Drop. The dir lives under
+/// [`lmdb_test_base`] rather than `OXEN_TEST_RUN_DIR` — see that fn's docs
+/// for why.
+#[cfg(test)]
+pub fn create_lmdb_safe_empty_dir() -> Result<RepoDirGuard, OxenError> {
+    let dir = create_prefixed_dir(lmdb_test_base(), "dir")?;
+    Ok(RepoDirGuard::new(dir))
+}
+
+/// Construct a fresh test repo dir, initialize a [`LocalRepository`] in it
+/// with the given [`crate::config::repository_config::MerkleStoreKind`], and
+/// return a [`TestLocalRepo`] that cleans the dir up on Drop. Mirrors the
+/// repo shape produced by the former
+/// `run_empty_local_repo_test_with_merkle_store` helper.
+///
+/// For `MerkleStoreKind::Lmdb` the repo dir is routed under
+/// [`lmdb_test_base`] so the LMDB env never lands on a VFS like Windows CI's
+/// ImDisk RAMDisk.
+#[cfg(test)]
+pub fn init_test_repo_with_merkle_store(
+    kind: crate::config::repository_config::MerkleStoreKind,
+) -> Result<TestLocalRepo, OxenError> {
+    use crate::config::repository_config::MerkleStoreKind;
+    init_test_env();
+    log::info!("<<<<< init_test_repo_with_merkle_store start ({kind:?})");
+    let repo_dir = match kind {
+        MerkleStoreKind::Lmdb => create_prefixed_dir(lmdb_test_base(), "repo")?,
+        MerkleStoreKind::File => create_repo_dir(test_run_dir())?,
+    };
+    let repo = repositories::init::init_with_version_and_merkle_store(
+        &repo_dir,
+        MinOxenVersion::LATEST,
+        kind,
+    )?;
+    log::info!(">>>>> init_test_repo_with_merkle_store ready");
+    Ok(TestLocalRepo::new(repo))
+}
+
+/// Async variant of [`init_test_repo_with_merkle_store`] — also initializes
+/// the version store, mirroring the former
+/// `run_empty_local_repo_test_with_merkle_store_async` helper.
+#[cfg(test)]
+pub async fn init_test_repo_merkle_init_version_store_async(
+    kind: crate::config::repository_config::MerkleStoreKind,
+) -> Result<TestLocalRepo, OxenError> {
+    let handle = init_test_repo_with_merkle_store(kind)?;
+    handle.version_store().init().await?;
+    Ok(handle)
 }
 
 pub async fn run_empty_local_repo_test_async<T, Fut>(test: T) -> Result<(), OxenError>
@@ -341,7 +449,7 @@ where
     let repo_dir = create_repo_dir(test_run_dir())?;
     let repo = repositories::init(&repo_dir)?;
 
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     version_store.init().await?;
 
     log::info!(">>>>> run_empty_local_repo_test_async running test");
@@ -516,41 +624,6 @@ where
     Ok(())
 }
 
-/// Test where the local repo has training data in it
-pub async fn run_training_data_sync_test_no_commits<T, Fut>(test: T) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository, RemoteRepository) -> Fut,
-    Fut: Future<Output = Result<RemoteRepository, OxenError>>,
-{
-    init_test_env();
-    log::info!("<<<<< run_training_data_sync_test_no_commits start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let local_repo = repositories::init(&repo_dir)?;
-
-    // Write all the training data files
-    populate_dir_with_training_data(&repo_dir)?;
-
-    let remote_repo = create_remote_repo(&local_repo).await?;
-    println!("Got remote repo: {remote_repo:?}");
-
-    // Run test to see if it panic'd
-    log::info!(">>>>> run_training_data_sync_test_no_commits running test");
-    let result = match test(local_repo, remote_repo.clone()).await {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("Error running test. Err: {err}");
-            false
-        }
-    };
-
-    // Cleanup local repo
-    maybe_cleanup_repo_with_remote(&repo_dir, &remote_repo).await?;
-
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result);
-    Ok(())
-}
-
 pub async fn make_many_commits(local_repo: &LocalRepository) -> Result<(), OxenError> {
     // Make a few commits before we sync
     repositories::add(local_repo, local_repo.path.join("train")).await?;
@@ -686,50 +759,6 @@ where
 
     // Run test to see if it panic'd
     log::info!(">>>>> run_select_data_sync_remote running test");
-    let result = match test(local_repo, remote_repo.clone()).await {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("Error running test. Err: {err}");
-            false
-        }
-    };
-
-    // Cleanup local repo
-    maybe_cleanup_repo_with_remote(&repo_dir, &remote_repo).await?;
-
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result);
-    Ok(())
-}
-
-/// Test where certain data is synced to the remote
-pub async fn run_subset_of_data_fully_sync_remote<T, Fut>(
-    data: &str,
-    test: T,
-) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository, RemoteRepository) -> Fut,
-    Fut: Future<Output = Result<RemoteRepository, OxenError>>,
-{
-    init_test_env();
-    log::info!("<<<<< run_subset_of_data_fully_sync_remote start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let mut local_repo = repositories::init(&repo_dir)?;
-
-    // Write all the training data files
-    populate_select_training_data(&repo_dir, data)?;
-
-    // Create remote
-    let remote_repo = create_remote_repo(&local_repo).await?;
-
-    // Add remote
-    let remote_url = repo_remote_url_from(&local_repo.dirname());
-    command::config::set_remote(&mut local_repo, constants::DEFAULT_REMOTE_NAME, &remote_url)?;
-    // Push data
-    repositories::push(&local_repo).await?;
-
-    // Run test to see if it panic'd
-    log::info!(">>>>> run_subset_of_data_fully_sync_remote running test");
     let result = match test(local_repo, remote_repo.clone()).await {
         Ok(_) => true,
         Err(err) => {
@@ -1114,7 +1143,7 @@ where
     let repo_dir = create_repo_dir(test_run_dir())?;
     let repo = repositories::init(&repo_dir)?;
 
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     version_store.init().await?;
 
     // Write all the files
@@ -1310,35 +1339,6 @@ where
     Ok(())
 }
 
-pub async fn run_select_data_repo_test_no_commits<T>(data: &str, test: T) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository) -> Result<(), OxenError> + std::panic::UnwindSafe,
-{
-    init_test_env();
-    log::info!("<<<<< run_select_data_repo_test_no_commits start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let repo = repositories::init(&repo_dir)?;
-
-    // Write the select files
-    populate_select_training_data(&repo_dir, data)?;
-
-    // Run test to see if it panic'd
-    log::info!(">>>>> run_select_data_repo_test_no_commits running test");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match test(repo) {
-        Ok(_) => {}
-        Err(err) => {
-            panic!("Error running test. Err: {err}");
-        }
-    }));
-
-    // Remove repo dir
-    maybe_cleanup_repo(&repo_dir)?;
-
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result.is_ok());
-    Ok(())
-}
-
 /// Run a test on a repo with a bunch of files
 pub async fn run_training_data_repo_test_fully_committed_async<T, Fut>(
     test: T,
@@ -1351,45 +1351,6 @@ where
     log::info!("<<<<< run_training_data_repo_test_fully_committed_async start");
     let repo_dir = create_repo_dir(test_run_dir())?;
     let repo = repositories::init(&repo_dir)?;
-
-    // Write all the files
-    populate_dir_with_training_data(&repo_dir)?;
-    // Add all the files
-    repositories::add(&repo, &repo.path).await?;
-    log::debug!("about to commit this repo");
-    repositories::commit(&repo, "adding all data baby")?;
-    log::debug!("successfully committed the repo");
-    // Run test to see if it panic'd
-    log::info!(">>>>> run_training_data_repo_test_fully_committed_async running test");
-    let result = match test(repo).await {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("Error running test. Err: {err}");
-            false
-        }
-    };
-
-    // Remove repo dir
-    maybe_cleanup_repo(&repo_dir)?;
-
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result);
-    Ok(())
-}
-
-/// Run a test on a repo with a bunch of files
-pub async fn run_training_data_repo_test_fully_committed_async_min_version<T, Fut>(
-    version: MinOxenVersion,
-    test: T,
-) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository) -> Fut,
-    Fut: Future<Output = Result<(), OxenError>>,
-{
-    init_test_env();
-    log::info!("<<<<< run_training_data_repo_test_fully_committed_async_min_version start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let repo = repositories::init::init_with_version(&repo_dir, version)?;
 
     // Write all the files
     populate_dir_with_training_data(&repo_dir)?;
@@ -1494,146 +1455,6 @@ where
 
     // Assert everything okay after we cleanup the repo dir
     assert!(result);
-    Ok(())
-}
-
-/// Run a test on a repo with just a nested annotations/train/bounding_box.csv file
-pub async fn run_bounding_box_csv_repo_test_fully_committed<T>(test: T) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository) -> Result<(), OxenError> + std::panic::UnwindSafe,
-{
-    init_test_env();
-    log::info!("<<<<< run_bounding_box_csv_repo_test_fully_committed start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let repo = repositories::init(&repo_dir)?;
-
-    // Add all the files
-    create_bounding_box_csv(&repo.path)?;
-    repositories::add(&repo, &repo.path).await?;
-    repositories::commit(&repo, "adding all data baby")?;
-
-    // Run test to see if it panic'd
-    log::info!(">>>>> run_bounding_box_csv_repo_test_fully_committed running test");
-    let result = match test(repo) {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("Error running test. Err: {err}");
-            false
-        }
-    };
-
-    // Remove repo dir
-    maybe_cleanup_repo(&repo_dir)?;
-
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result);
-    Ok(())
-}
-
-pub async fn run_compare_data_repo_test_fully_committed<T>(test: T) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository) -> Result<(), OxenError> + std::panic::UnwindSafe,
-{
-    init_test_env();
-    log::info!("<<<<< run_compare_data_repo_test_fully_committed start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let repo = repositories::init(&repo_dir)?;
-
-    // Has 6 match observations in both keys, 5 diffs,
-    // 2 key sets left only, 1 keyset right only.
-    write_txt_file_to_path(
-        repo.path.join("compare_left.csv"),
-        r"height,weight,gender,target,other_target
-57,150,M,1,yes
-57,160,M,0,yes
-58,160,M,1,no
-59,170,F,1,no
-60,170,F,0,yes
-61,180,F,0,yes
-62,180,F,0,no
-63,190,M,1,no
-64,190,M,0,yes
-65,200,M,0,no
-70,240,M,1,yes
-71,241,F,1,no
-71,242,F,1,no",
-    )?;
-
-    write_txt_file_to_path(
-        repo.path.join("compare_right.csv"),
-        r"height,weight,gender,target,other_target
-57,150,M,1,yes
-57,160,M,0,yes
-58,160,M,1,no
-59,170,F,1,no
-60,170,F,0,yes
-61,180,F,0,yes
-62,180,F,1,no
-63,190,M,0,no
-64,190,M,1,yes
-65,200,M,0,yes
-70,240,M,0,no
-71,241,M,1,no",
-    )?;
-
-    repositories::add(&repo, &repo.path).await?;
-    repositories::commit(&repo, "adding both csvs for compare")?;
-
-    log::info!(">>>>> run_compare_data_repo_test_fully_committed running test");
-    let result = match test(repo) {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("Error running test. Err: {err}");
-            false
-        }
-    };
-
-    maybe_cleanup_repo(&repo_dir)?;
-
-    assert!(result);
-    Ok(())
-}
-
-/// Run a test on a repo with a bunch of files
-pub async fn run_training_data_repo_test_fully_committed_w_version<T>(
-    version: MinOxenVersion,
-    test: T,
-) -> Result<(), OxenError>
-where
-    T: FnOnce(LocalRepository) -> Result<(), OxenError> + std::panic::UnwindSafe,
-{
-    init_test_env();
-    log::info!("<<<<< run_training_data_repo_test_fully_committed start");
-    let repo_dir = create_repo_dir(test_run_dir())?;
-    let repo = repositories::init::init_with_version(&repo_dir, version)?;
-    // Write all the files
-    populate_dir_with_training_data(&repo_dir)?;
-
-    // Add all the files
-    repositories::add(&repo, &repo.path).await?;
-
-    // Get the status and print it
-    let status = repositories::status(&repo).await?;
-    println!("setup status: {status:?}");
-    status.print();
-
-    // Commit the data
-    repositories::commit(&repo, "adding all data baby")?;
-
-    // Run test to see if it panic'd
-    log::info!(">>>>> run_training_data_repo_test_fully_committed running test");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match test(repo) {
-        Ok(_) => {}
-        Err(err) => {
-            panic!("Error running test. Err: {err}");
-        }
-    }));
-
-    // Remove repo dir
-    maybe_cleanup_repo(&repo_dir)?;
-
-    // Assert everything okay after we cleanup the repo dir
-    assert!(result.is_ok());
     Ok(())
 }
 

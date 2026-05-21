@@ -233,7 +233,7 @@ async fn read_file_at_commit(
     let Some(file_node) = repositories::tree::get_file_by_path(repo, commit, path)? else {
         return Ok(None);
     };
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     let mut stream = version_store
         .get_version_stream(&file_node.hash().to_string())
         .await?;

@@ -42,7 +42,7 @@ async fn read_staged_file(
     }
 
     let file_node = staged_node.node.file()?;
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     let mut stream = version_store
         .get_version_stream(&file_node.hash().to_string())
         .await?;

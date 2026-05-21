@@ -1,5 +1,4 @@
 use std;
-use std::collections::HashMap;
 use std::io::{self, Cursor, ErrorKind};
 use std::path::{Path, PathBuf};
 
@@ -675,17 +674,8 @@ impl VersionStore for LocalVersionStore {
         Ok(result)
     }
 
-    fn storage_type(&self) -> &str {
-        "local"
-    }
-
-    fn storage_settings(&self) -> HashMap<String, String> {
-        let mut settings = HashMap::new();
-
-        let root_path_str = self.root_path.to_str().unwrap_or("").to_string();
-        settings.insert("path".to_string(), root_path_str);
-
-        settings
+    fn storage_kind(&self) -> crate::storage::StorageKind {
+        crate::storage::StorageKind::Local
     }
 }
 
@@ -920,6 +910,33 @@ mod tests {
         // Store and check again
         store.store_version(hash, data).await.unwrap();
         assert!(store.version_exists(hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_find_missing_versions_returns_only_absent_hashes() {
+        let (_temp_dir, store) = setup().await;
+        let present = "aaaa1111aaaa1111";
+        let also_present = "bbbb2222bbbb2222";
+        let absent = "cccc3333cccc3333";
+        store.store_version(present, b"x").await.unwrap();
+        store.store_version(also_present, b"y").await.unwrap();
+
+        let missing = store
+            .find_missing_versions(&[
+                present.to_string(),
+                absent.to_string(),
+                also_present.to_string(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(missing, vec![absent.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_find_missing_versions_empty_input_returns_empty() {
+        let (_temp_dir, store) = setup().await;
+        let missing = store.find_missing_versions(&[]).await.unwrap();
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]

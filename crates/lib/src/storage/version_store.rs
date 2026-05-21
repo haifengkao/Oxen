@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -6,14 +5,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::AsyncRead;
 use tokio_stream::Stream;
+use utoipa::ToSchema;
 
 use crate::constants;
+use crate::constants::MAX_CONCURRENT_VERSION_PROBES;
 use crate::error::OxenError;
-use crate::opts::StorageOpts;
-use crate::storage::{LocalVersionStore, S3VersionStore};
+use crate::storage::LocalVersionStore;
 use crate::util;
 use crate::view::versions::CleanCorruptedVersionsResult;
 
@@ -74,6 +75,36 @@ impl LocalFilePath {
     }
 }
 
+/// Storage backend kind. Serializes as `"local"` / `"s3"` on the wire and on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageKind {
+    #[default]
+    Local,
+    S3,
+}
+
+impl std::fmt::Display for StorageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageKind::Local => f.write_str("local"),
+            StorageKind::S3 => f.write_str("s3"),
+        }
+    }
+}
+
+impl std::str::FromStr for StorageKind {
+    type Err = OxenError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "local" => Ok(StorageKind::Local),
+            "s3" => Ok(StorageKind::S3),
+            other => Err(OxenError::UnsupportedStorageKind(other.to_string())),
+        }
+    }
+}
+
 /// Configuration for version storage backend.
 ///
 /// Persisted in each repo's `config.toml` under `[storage]`. On-disk shape:
@@ -89,18 +120,14 @@ impl LocalFilePath {
 /// value is promoted into `versions_path` on load. Any path — new or legacy — is
 /// re-emitted as `versions_path` in `[storage]`; `[storage.settings]` goes away on
 /// the first save after upgrade.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, Default)]
 pub struct StorageConfig {
-    pub kind: String,
+    pub kind: StorageKind,
     /// For the "local" backend, the directory where version files are stored. If `None`,
     /// defaults to `<repo>/.oxen/versions/files`. A `.oxen`-prefixed relative path is
     /// joined with the repo directory at runtime, so repos stay portable if moved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub versions_path: Option<PathBuf>,
-}
-
-fn default_storage_kind() -> String {
-    "local".to_string()
 }
 
 impl<'de> Deserialize<'de> for StorageConfig {
@@ -116,8 +143,8 @@ impl<'de> Deserialize<'de> for StorageConfig {
 
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default = "default_storage_kind")]
-            kind: String,
+            #[serde(default)]
+            kind: StorageKind,
             #[serde(default)]
             versions_path: Option<PathBuf>,
             // Pre-rename location; consumed on load for backwards compatibility,
@@ -134,15 +161,6 @@ impl<'de> Deserialize<'de> for StorageConfig {
             kind: raw.kind,
             versions_path,
         })
-    }
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            kind: default_storage_kind(),
-            versions_path: None,
-        }
     }
 }
 
@@ -313,6 +331,39 @@ pub trait VersionStore: Debug + Send + Sync + 'static {
     /// * `hash` - The content hash to check
     async fn version_exists(&self, hash: &str) -> Result<bool, OxenError>;
 
+    /// Returns the subset of `hashes` whose blobs are absent from this store. Used by
+    /// bulk endpoints that need to fail fast on missing content before committing to
+    /// a streaming response.
+    ///
+    /// The default implementation probes each hash with `version_exists` in parallel,
+    /// bounded by `MAX_CONCURRENT_VERSION_PROBES`. Backends with cheaper batch-existence
+    /// primitives (e.g. a future inventory-backed store) may override.
+    ///
+    /// # Arguments
+    /// * `hashes` - The content hashes to check
+    async fn find_missing_versions(&self, hashes: &[String]) -> Result<Vec<String>, OxenError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let max_concurrent = MAX_CONCURRENT_VERSION_PROBES.min(hashes.len());
+
+        let mut probes = futures_util::stream::iter(hashes.iter().cloned())
+            .map(|hash| async move {
+                let exists = self.version_exists(&hash).await?;
+                Ok::<_, OxenError>((hash, exists))
+            })
+            .buffer_unordered(max_concurrent);
+
+        let mut missing = Vec::new();
+        while let Some(result) = probes.next().await {
+            let (hash, exists) = result?;
+            if !exists {
+                missing.push(hash);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Delete a version
     ///
     /// # Arguments
@@ -334,27 +385,20 @@ pub trait VersionStore: Debug + Send + Sync + 'static {
         dry_run: bool,
     ) -> Result<CleanCorruptedVersionsResult, OxenError>;
 
-    /// Get the storage type identifier (e.g., "local", "s3")
-    fn storage_type(&self) -> &str;
-
-    /// Get the storage-specific settings
-    fn storage_settings(&self) -> HashMap<String, String>;
+    /// Which storage backend kind this is.
+    fn storage_kind(&self) -> StorageKind;
 }
 
 /// This only creates a version store struct, it does not initialize it
 pub fn create_version_store(
     repo_dir: &Path,
-    storage_opts: &StorageOpts,
+    config: &StorageConfig,
 ) -> Result<Arc<dyn VersionStore>, OxenError> {
-    match storage_opts.kind.as_str() {
-        "local" => {
-            let Some(ref local_storage_opts) = storage_opts.local_storage_opts else {
-                return Err(OxenError::basic_str("local storage opts not found"));
-            };
-
-            let versions_dir = if let Some(path) = &local_storage_opts.path {
+    match config.kind {
+        StorageKind::Local => {
+            let versions_dir = if let Some(path) = &config.versions_path {
                 if path.starts_with(".oxen") {
-                    // if the path is relative, convert to absolute path
+                    // Relative path → join with repo dir so the repo stays portable.
                     repo_dir.join(path)
                 } else {
                     path.clone()
@@ -366,23 +410,8 @@ pub fn create_version_store(
             };
 
             let store = LocalVersionStore::new(versions_dir);
-
             Ok(Arc::new(store))
         }
-        "s3" => {
-            let Some(ref s3_opts) = storage_opts.s3_opts else {
-                return Err(OxenError::basic_str("s3 storage opts not found"));
-            };
-
-            let bucket = s3_opts.bucket.clone();
-            let prefix = s3_opts.prefix.clone().unwrap_or("versions".to_string());
-            let store = S3VersionStore::new(bucket, prefix);
-
-            Ok(Arc::new(store))
-        }
-        _ => Err(OxenError::basic_str(format!(
-            "Unsupported async storage type: {}",
-            storage_opts.kind
-        ))),
+        StorageKind::S3 => Err(OxenError::S3BackendNotImplemented),
     }
 }

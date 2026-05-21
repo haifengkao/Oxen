@@ -103,7 +103,7 @@ pub async fn drop_paths(
     paths: &[PathBuf],
 ) -> Result<Vec<OfflineEntry>, OxenError> {
     let commit = repositories::commits::head_commit(repo)?;
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     let mut index = load_index(repo)?;
     let mut dropped = Vec::new();
 
@@ -176,7 +176,7 @@ pub async fn get_paths(
     paths: &[PathBuf],
 ) -> Result<Vec<OfflineEntry>, OxenError> {
     let commit = repositories::commits::head_commit(repo)?;
-    let version_store = repo.version_store()?;
+    let version_store = repo.version_store();
     let mut index = load_index(repo)?;
     let mut restored = Vec::new();
 

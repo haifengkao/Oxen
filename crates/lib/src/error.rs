@@ -14,11 +14,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::task::JoinError;
 
+use crate::config::repository_config::RepoConfigError;
+use crate::core::db::merkle_node::lmdb::LmdbError;
 use crate::core::db::merkle_node::merkle_node_db::MerkleDbError;
 use crate::model::ParsedResource;
 use crate::model::RepoNew;
 use crate::model::Schema;
 use crate::model::Workspace;
+use crate::model::merkle_tree::merkle_hash::HexHash;
 use crate::model::merkle_tree::node_type::InvalidMerkleTreeNodeType;
 
 pub mod path_buf_error;
@@ -55,6 +58,9 @@ pub enum OxenError {
     #[error("Repository '{0}' already exists")]
     RepoAlreadyExists(Box<RepoNew>),
 
+    #[error("Oxen repository already exists: {0:?}")]
+    RepoAlreadyExistsAtPath(PathBuf),
+
     /// Error when creating a repository: repo names are restricted.
     #[error("Invalid repository or namespace name '{0}'. Must match [a-zA-Z0-9][a-zA-Z0-9_.-]+")]
     InvalidRepoName(StringError),
@@ -62,6 +68,27 @@ pub enum OxenError {
     /// When `get_fork_status` cannot obtain the fork status for a repository.
     #[error("No fork status found.")]
     ForkStatusNotFound,
+
+    // TODO: Once all serialization paths use `*View` instead of `Workspace`, which requires `LocalRepository`
+    //       to implement `Serializable`, then these *StoreNotInitialized errors can be deleted.,
+    /// The [`MerkleStore`] or [`TransportMerkle`] for a [`LocalRepository`] was not initialized before access.
+    #[error("Merkle store not initialized")]
+    MerkleStoreNotInitialized,
+
+    /// LMDB-backed Merkle store was requested on a repository configured for a
+    /// virtual file system. LMDB requires a real, byte-addressable mmap target
+    /// and does not work on VFS mounts.
+    #[error(
+        "LMDB-backed Merkle store is not supported on virtual file systems. \
+         Either use the file-backed store (the default) or initialize the \
+         repository without --vfs."
+    )]
+    MerkleStoreLmdbNotSupportedOnVfs,
+
+    /// An error stemming from an invalid [`RepositoryConfig`] value encountered during parsing or saving.
+    #[error("{0}")]
+    RepoConfig(#[from] RepoConfigError),
+
     //
     // Remotes
     //
@@ -174,7 +201,9 @@ pub enum OxenError {
     #[error("Invalid version: {0}")]
     InvalidVersion(StringError),
 
+    //
     // Version Store
+    //
     /// An error uploading a file to the version store
     #[error("{0}")]
     Upload(StringError),
@@ -190,6 +219,15 @@ pub enum OxenError {
         hash: String,
         target_path: PathBufError,
     },
+
+    /// A caller supplied a storage backend kind that isn't recognized.
+    #[error("Unsupported storage kind: {0}")]
+    UnsupportedStorageKind(String),
+
+    /// The S3 version store backend is not yet implemented; admin/server wiring lands in a later
+    /// step of the storage-policy work.
+    #[error("S3 storage backend not yet implemented")]
+    S3BackendNotImplemented,
 
     /// `oxen restore` finished with one or more file-restore failures. Aggregated rather than
     /// fail-fast so the rest of the files can still be restored. The vector should be non-empty.
@@ -218,6 +256,18 @@ pub enum OxenError {
     // Attempting to make a commit with no changes from its parent is an error.
     #[error("No changes to commit")]
     NoChanges,
+
+    #[error("No such commit, dir, or vnode Merkle tree node with hash (hex): {0}")]
+    MerkleNodeNotFound(HexHash),
+
+    #[error(
+        "Unsupported node type adding to a child file. Only accept Commit, Directory, File, or VNode. Found: {0}"
+    )]
+    /// Contains the name of the incompatible type as reported by [`std::any::type_name_of_val`].
+    DisallowedNodeWrite(&'static str),
+
+    #[error("{0}")]
+    Lmdb(#[from] LmdbError),
 
     //
     // Schema (dataframes)
@@ -291,6 +341,21 @@ pub enum OxenError {
     /// Wraps errors encountered from file reading & writing operations.
     #[error("{0}")]
     IO(#[from] io::Error),
+
+    /// A `create`-shaped filesystem syscall failed at the given path (e.g. opening with
+    /// `O_CREAT`, creating a directory tree). Carries the underlying [`io::Error`] so
+    /// callers can match on `ErrorKind` (e.g. `AlreadyExists` for `O_EXCL` writers).
+    #[error("Could not create file: {0:?}: {1}")]
+    FileCreate(PathBuf, #[source] io::Error),
+
+    /// A rename syscall failed when moving `src` to `dst`.
+    #[error("Could not rename file from {src:?} to {dst:?}: {source}")]
+    FileRename {
+        src: PathBuf,
+        dst: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     /// Encountered when authentication fails. Contains the authentication error message.
     #[error("Authentication failed: {0}")]
@@ -392,8 +457,12 @@ pub enum OxenError {
     RmpDecodeError(#[from] rmp_serde::decode::Error),
 
     /// Wraps any error that we get from joining tasks.
-    #[error("{0}")]
-    JoinError(#[from] JoinError),
+    #[error("{context}{cause}")]
+    JoinError {
+        context: String,
+        #[source]
+        cause: JoinError,
+    },
 
     /// A synchronization primitive (Mutex/RwLock) was found poisoned because a thread panicked
     /// while holding it. Indicates a bug; should not occur in normal operation.
@@ -442,11 +511,51 @@ pub enum OxenError {
         source: Box<OxenError>,
     },
 
+    /// An HTTP response from oxen-server arrived with a non-success status and a body
+    /// that parsed as a structured `OxenResponse`. The HTTP status, request URL, and
+    /// human-readable message from the response body are all carried on the variant
+    /// so callers can classify the failure (e.g. 4xx as fatal, 5xx as retryable).
+    #[error("Err status [{status}] from url {url} [{message}]")]
+    HttpStatusError {
+        url: String,
+        status: http::StatusCode,
+        message: String,
+    },
+
+    /// An HTTP response arrived with a non-success status but its body wasn't a
+    /// structured `OxenResponse` — typically because an intermediate proxy returned
+    /// an HTML error page (e.g. a gateway-level 502). Carries the request URL and
+    /// HTTP status so callers can classify the failure even though the body is opaque.
+    #[error("Could not deserialize response from [{url}]\n{status}")]
+    HttpDeserializeError {
+        url: String,
+        status: http::StatusCode,
+    },
+
+    /// The bulk versions download endpoint reported that one or more requested content
+    /// blobs are absent from the server's version store. The full list of missing
+    /// hashes is carried on the variant so the client can surface every missing blob
+    /// to the user in a single error.
+    #[error("{}", format_versions_missing_on_server(hashes))]
+    VersionsMissingOnServer { hashes: Vec<String> },
+
+    /// An `OxenResponse` arrived with `status == "warning"`: the request succeeded but
+    /// the server attached an advisory message.
+    #[error("Remote Warning: {0}")]
+    RemoteWarning(StringError),
+
+    /// An `OxenResponse` arrived with a `status` field that's neither "success",
+    /// "warning", nor "error" — indicating a protocol mismatch between client and
+    /// server, or a server-side bug.
+    #[error("Unknown status [{0}]")]
+    UnknownRemoteResponseStatus(StringError),
+
     // Fallback
     // TODO: remove all uses of `Basic` and replace with specific errors.
     #[error("{0}")]
     Basic(StringError),
 
+    // TODO: remove all uses of `Basic` and replace with specific errors.
     #[error("{0}")]
     InternalError(StringError),
 }
@@ -458,6 +567,30 @@ fn format_download_entries(entries: &[(String, PathBuf)]) -> String {
     let mut out = format!("Failing batch ({} files):", entries.len());
     for (hash, path) in entries {
         let _ = write!(out, "\n  {} (hash: {hash})", path.display());
+    }
+    out
+}
+
+/// Whether an HTTP status code, if seen on a failed request, indicates the request
+/// won't succeed on retry. 4xx is fatal *except* for 408 (Request Timeout) and 429
+/// (Too Many Requests) — both are conventionally retryable per HTTP semantics.
+fn is_fatal_http_status(status: http::StatusCode) -> bool {
+    if status == http::StatusCode::REQUEST_TIMEOUT || status == http::StatusCode::TOO_MANY_REQUESTS
+    {
+        return false;
+    }
+    status.is_client_error()
+}
+
+/// Multi-line render for [`OxenError::VersionsMissingOnServer`]. Lists each missing hash
+/// so the user can map the failure back to specific blobs.
+fn format_versions_missing_on_server(hashes: &[String]) -> String {
+    let mut out = format!(
+        "Server is missing {} version blob(s) requested in this batch:",
+        hashes.len()
+    );
+    for hash in hashes {
+        let _ = write!(out, "\n  {hash}");
     }
     out
 }
@@ -553,7 +686,7 @@ impl OxenError {
             WorkspaceStagedDbCorrupted { .. } => {
                 "Recreate the workspace: `oxen workspace delete <id>` then re-create it."
             }
-            DownloadBatchExhausted { .. } => {
+            DownloadBatchExhausted { .. } | VersionsMissingOnServer { .. } => {
                 "If a content blob is missing on the server, run `oxen push --missing-files` from a clone with the full local history to repair it."
             }
             _ => return None,
@@ -586,6 +719,31 @@ impl OxenError {
                 | OxenError::WorkspaceNotFound(_)
                 | OxenError::QueryableWorkspaceNotFound
         )
+    }
+
+    /// Returns true for errors that won't change on retry: authentication failures,
+    /// most 4xx HTTP responses, server-confirmed missing version blobs, resource-
+    /// not-found variants, and unrecognized remote response shapes (which signal
+    /// protocol mismatch or a server bug, neither of which retry resolves). Retry
+    /// loops use this to bail out immediately rather than paying exponential
+    /// backoff for a fixed outcome.
+    ///
+    /// Returns false for 5xx responses, connection errors, and the retryable 4xx
+    /// cases (408 Request Timeout, 429 Too Many Requests), all of which can reflect
+    /// transient conditions that resolve on retry.
+    pub fn is_fatal_for_retry(&self) -> bool {
+        if self.is_auth_error() || self.is_not_found() {
+            return true;
+        }
+        match self {
+            OxenError::HttpStatusError { status, .. }
+            | OxenError::HttpDeserializeError { status, .. } => is_fatal_http_status(*status),
+            OxenError::HTTP(req_err) => req_err.status().is_some_and(is_fatal_http_status),
+            OxenError::VersionsMissingOnServer { .. } => true,
+            OxenError::VersionStoreDataMissing { .. } => true,
+            OxenError::UnknownRemoteResponseStatus(_) => true,
+            _ => false,
+        }
     }
 
     //
@@ -770,11 +928,7 @@ impl OxenError {
     }
 
     pub fn file_create_error(path: impl AsRef<Path>, error: std::io::Error) -> OxenError {
-        OxenError::basic_str(format!(
-            "Could not create file: {:?} error {:?}",
-            path.as_ref(),
-            error
-        ))
+        OxenError::FileCreate(path.as_ref().to_path_buf(), error)
     }
 
     pub fn file_open_error(path: impl AsRef<Path>, error: std::io::Error) -> OxenError {
@@ -816,13 +970,13 @@ impl OxenError {
     pub fn file_rename_error(
         src: impl AsRef<Path>,
         dst: impl AsRef<Path>,
-        err: impl std::fmt::Debug,
+        source: std::io::Error,
     ) -> OxenError {
-        OxenError::basic_str(format!(
-            "File rename error: {err:?}\nCould not move from `{:?}` to `{:?}`",
-            src.as_ref(),
-            dst.as_ref()
-        ))
+        OxenError::FileRename {
+            src: src.as_ref().to_path_buf(),
+            dst: dst.as_ref().to_path_buf(),
+            source,
+        }
     }
 
     pub fn cannot_overwrite_files(paths: &[PathBuf]) -> OxenError {
@@ -889,6 +1043,15 @@ impl OxenError {
             parent.as_ref(),
             name.as_ref()
         ))
+    }
+}
+
+impl From<JoinError> for OxenError {
+    fn from(error: JoinError) -> Self {
+        OxenError::JoinError {
+            context: "".to_string(),
+            cause: error,
+        }
     }
 }
 
@@ -1002,5 +1165,129 @@ mod tests {
             source.to_string().contains("file not found"),
             "source chain missing inner message: {source}"
         );
+    }
+
+    #[test]
+    fn http_status_error_display_includes_url_status_and_message() {
+        let err = OxenError::HttpStatusError {
+            url: "https://hub.example.com/api/repos/x/y/versions".to_string(),
+            status: http::StatusCode::NOT_FOUND,
+            message: "Resource not found".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("404"), "missing status: {msg}");
+        assert!(msg.contains("/versions"), "missing url: {msg}");
+        assert!(msg.contains("Resource not found"), "missing message: {msg}");
+    }
+
+    #[test]
+    fn http_deserialize_error_display_includes_url_and_status() {
+        let err = OxenError::HttpDeserializeError {
+            url: "https://hub.example.com/api/repos/x/y/versions".to_string(),
+            status: http::StatusCode::BAD_GATEWAY,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("502"), "missing status: {msg}");
+        assert!(msg.contains("/versions"), "missing url: {msg}");
+    }
+
+    #[test]
+    fn versions_missing_on_server_display_lists_each_hash() {
+        let err = OxenError::VersionsMissingOnServer {
+            hashes: vec!["abc".to_string(), "def".to_string()],
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("2 version blob"), "missing count: {msg}");
+        assert!(msg.contains("abc"), "missing first hash: {msg}");
+        assert!(msg.contains("def"), "missing second hash: {msg}");
+    }
+
+    #[test]
+    fn is_fatal_for_retry_short_circuits_on_4xx_http_status_error() {
+        let make = |status| OxenError::HttpStatusError {
+            url: "u".to_string(),
+            status,
+            message: "nope".to_string(),
+        };
+        assert!(
+            make(http::StatusCode::NOT_FOUND).is_fatal_for_retry(),
+            "404 should be fatal"
+        );
+        // 408 (timeout) and 429 (rate limit) are 4xx but retryable per HTTP semantics —
+        // a timed-out request can be re-sent and a rate-limited one should back off.
+        assert!(
+            !make(http::StatusCode::REQUEST_TIMEOUT).is_fatal_for_retry(),
+            "408 should be retryable"
+        );
+        assert!(
+            !make(http::StatusCode::TOO_MANY_REQUESTS).is_fatal_for_retry(),
+            "429 should be retryable"
+        );
+    }
+
+    #[test]
+    fn is_fatal_for_retry_retries_on_5xx_http_status_error() {
+        let err = OxenError::HttpStatusError {
+            url: "u".to_string(),
+            status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: "blip".to_string(),
+        };
+        assert!(!err.is_fatal_for_retry(), "5xx should be retryable");
+    }
+
+    #[test]
+    fn is_fatal_for_retry_classifies_deserialize_error_by_status() {
+        let make = |status| OxenError::HttpDeserializeError {
+            url: "u".to_string(),
+            status,
+        };
+        assert!(
+            make(http::StatusCode::NOT_FOUND).is_fatal_for_retry(),
+            "404 deserialize fail is fatal"
+        );
+        assert!(
+            !make(http::StatusCode::BAD_GATEWAY).is_fatal_for_retry(),
+            "5xx deserialize fail (HTML proxy page) is retryable"
+        );
+        // 408 and 429 stay retryable even when the body fails to parse.
+        assert!(
+            !make(http::StatusCode::REQUEST_TIMEOUT).is_fatal_for_retry(),
+            "408 deserialize fail should be retryable"
+        );
+        assert!(
+            !make(http::StatusCode::TOO_MANY_REQUESTS).is_fatal_for_retry(),
+            "429 deserialize fail should be retryable"
+        );
+    }
+
+    #[test]
+    fn is_fatal_for_retry_short_circuits_on_versions_missing_on_server() {
+        let err = OxenError::VersionsMissingOnServer {
+            hashes: vec!["abc".to_string()],
+        };
+        assert!(err.is_fatal_for_retry());
+    }
+
+    #[test]
+    fn is_fatal_for_retry_short_circuits_on_unknown_remote_response_status() {
+        // Unrecognized status field indicates protocol mismatch or a server bug —
+        // retrying won't change either.
+        let err = OxenError::UnknownRemoteResponseStatus("not-a-real-status".into());
+        assert!(err.is_fatal_for_retry());
+    }
+
+    #[test]
+    fn is_fatal_for_retry_short_circuits_on_auth_and_not_found() {
+        assert!(OxenError::authentication("nope").is_fatal_for_retry());
+        assert!(OxenError::resource_not_found("path").is_fatal_for_retry());
+    }
+
+    #[test]
+    fn is_fatal_for_retry_keeps_retrying_on_generic_basic_error() {
+        // Untyped errors (e.g. a network timeout flattened to Basic) shouldn't poison
+        // the retry loop — we only short-circuit when we have positive evidence the
+        // request can't succeed.
+        let err = OxenError::Basic(StringError::from("connection reset"));
+        assert!(!err.is_fatal_for_retry());
     }
 }
