@@ -26,7 +26,7 @@ use crate::model::diff::tabular_diff::{
 use crate::model::staged_data::StagedDataOpts;
 use crate::model::{
     Commit, CommitEntry, DataFrameDiff, DiffEntry, EntryDataType, LocalRepository, ParsedResource,
-    Schema,
+    Schema, StagedEntryStatus,
 };
 use crate::storage::version_store::VersionStore;
 use crate::view::Pagination;
@@ -172,6 +172,7 @@ pub async fn diff_uncommitted(
     let status_opts = StagedDataOpts::from_paths(&[path_1.to_path_buf()]);
     let status = repositories::status::status_from_opts(repo, &status_opts).await?;
     let unstaged_files = status.unstaged_files();
+    let unstaged_file_set: HashSet<PathBuf> = unstaged_files.iter().cloned().collect();
     log::debug!("unstaged_files: {unstaged_files:?}");
     let commit_1 = repositories::revisions::get(repo, rev_1)?
         .ok_or_else(|| OxenError::RevisionNotFound(rev_1.into()))?;
@@ -203,6 +204,44 @@ pub async fn diff_uncommitted(
             .await?,
         );
         log::debug!("diff_result: {diff_result:?}");
+    }
+
+    let mut staged_files: Vec<_> = status.staged_files.iter().collect();
+    staged_files.sort_by_key(|(path, _)| *path);
+    for (file, staged_entry) in staged_files {
+        if unstaged_file_set.contains(file) {
+            continue;
+        }
+
+        let node_1 = match repositories::entries::get_file(repo, &commit_1, file.as_path()) {
+            Ok(node) => node,
+            Err(err) => {
+                log::error!("Failed to get file {file:?}: {err}");
+                None
+            }
+        };
+
+        let node_2 = if staged_entry.status == StagedEntryStatus::Removed {
+            None
+        } else {
+            let staged_node = core::staged::read_from_staged_db_read_only(repo, file.as_path())?
+                .ok_or_else(|| {
+                    OxenError::basic_str(format!("No staged entry found for {file:?}"))
+                })?;
+            Some(staged_node.node.file()?)
+        };
+
+        diff_result.push(
+            diff_file_nodes(
+                repo,
+                node_1,
+                node_2,
+                opts.keys.clone(),
+                opts.targets.clone(),
+                vec![],
+            )
+            .await?,
+        );
     }
 
     Ok(diff_result)
@@ -1973,6 +2012,93 @@ train/cat_2.jpg,cat,30.5,44.0,333,396
                     assert_eq!(&lines[3].text, "how are you doing?");
                 }
                 _ => panic!("expected text result"),
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_diff_includes_staged_text_file_modifications() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let relative_path = PathBuf::from("hello.txt");
+            let file_path = repo.path.join(&relative_path);
+
+            util::fs::write_to_path(&file_path, "committed\n")?;
+            repositories::add(&repo, &file_path).await?;
+            repositories::commit(&repo, "Add hello")?;
+
+            util::fs::write_to_path(&file_path, "staged\n")?;
+            repositories::add(&repo, &file_path).await?;
+
+            let opts = DiffOpts {
+                repo_dir: Some(repo.path.clone()),
+                path_1: relative_path,
+                path_2: None,
+                keys: vec![],
+                targets: vec![],
+                revision_1: Some("HEAD".to_string()),
+                revision_2: None,
+                output: None,
+                page: 0,
+                page_size: 10,
+            };
+
+            let diff = repositories::diffs::diff(opts).await?;
+
+            match diff.first() {
+                Some(DiffResult::Text(result)) => {
+                    assert_eq!(result.lines.len(), 2);
+                    assert_eq!(result.lines[0].modification, ChangeType::Removed);
+                    assert_eq!(&result.lines[0].text, "committed");
+                    assert_eq!(result.lines[1].modification, ChangeType::Added);
+                    assert_eq!(&result.lines[1].text, "staged");
+                }
+                _ => panic!("expected staged text diff"),
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_diff_includes_staged_text_file_removals() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let relative_path = PathBuf::from("hello.txt");
+            let file_path = repo.path.join(&relative_path);
+
+            util::fs::write_to_path(&file_path, "committed\n")?;
+            repositories::add(&repo, &file_path).await?;
+            repositories::commit(&repo, "Add hello")?;
+
+            util::fs::remove_file(&file_path)?;
+            let opts = RmOpts::from_path(&relative_path);
+            repositories::rm(&repo, &opts).await?;
+
+            let opts = DiffOpts {
+                repo_dir: Some(repo.path.clone()),
+                path_1: relative_path,
+                path_2: None,
+                keys: vec![],
+                targets: vec![],
+                revision_1: Some("HEAD".to_string()),
+                revision_2: None,
+                output: None,
+                page: 0,
+                page_size: 10,
+            };
+
+            let diff = repositories::diffs::diff(opts).await?;
+
+            match diff.first() {
+                Some(DiffResult::Text(result)) => {
+                    assert_eq!(result.lines.len(), 1);
+                    assert_eq!(result.lines[0].modification, ChangeType::Removed);
+                    assert_eq!(&result.lines[0].text, "committed");
+                }
+                _ => panic!("expected staged removal diff"),
             }
 
             Ok(())
