@@ -2,7 +2,7 @@ use crate::errors::OxenHttpError;
 use crate::helpers::get_repo;
 use crate::params::{PageNumQuery, app_data, parse_resource, path_param};
 
-use liboxen::constants::AVG_CHUNK_SIZE;
+use liboxen::constants::stream_segment_size;
 use liboxen::error::OxenError;
 use liboxen::util::fs::replace_file_name_keep_extension;
 use liboxen::util::paginate;
@@ -33,7 +33,7 @@ pub async fn download_data_from_version_paths(
     let app_data = app_data(&req)?;
     let namespace = path_param(&req, "namespace")?.to_string();
     let repo_name = path_param(&req, "repo_name")?.to_string();
-    let repo = get_repo(&app_data.path, namespace, &repo_name)?;
+    let repo = get_repo(app_data, namespace, &repo_name)?;
 
     let mut bytes = web::BytesMut::new();
     while let Some(item) = body.next().await {
@@ -103,7 +103,7 @@ pub async fn download_chunk(
     let app_data = app_data(&req)?;
     let namespace = path_param(&req, "namespace")?.to_string();
     let repo_name = path_param(&req, "repo_name")?.to_string();
-    let repo = get_repo(&app_data.path, namespace, &repo_name)?;
+    let repo = get_repo(app_data, namespace, &repo_name)?;
     let resource = parse_resource(&req, &repo)?;
     let commit = resource.clone().commit.ok_or(OxenHttpError::NotFound)?;
     let path = resource.path.clone();
@@ -117,7 +117,7 @@ pub async fn download_chunk(
 
     let version_store = repo.version_store();
     let chunk_start: u64 = query.chunk_start.unwrap_or(0);
-    let chunk_size: u64 = query.chunk_size.unwrap_or(AVG_CHUNK_SIZE);
+    let chunk_size: u64 = query.chunk_size.unwrap_or_else(stream_segment_size);
 
     let file_node = match repositories::entries::get_file(&repo, &commit, &path)? {
         Some(node) => node,
@@ -141,7 +141,7 @@ pub async fn list_tabular(
     let namespace = path_param(&req, "namespace")?.to_string();
     let repo_name = path_param(&req, "repo_name")?.to_string();
     let commit_or_branch = path_param(&req, "commit_or_branch")?.to_string();
-    let repo = get_repo(&app_data.path, namespace, repo_name)?;
+    let repo = get_repo(app_data, namespace, repo_name)?;
     let commit = repositories::revisions::get(&repo, &commit_or_branch)?
         .ok_or_else(|| OxenError::RevisionNotFound(commit_or_branch.into()))?;
 

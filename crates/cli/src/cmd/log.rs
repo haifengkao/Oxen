@@ -13,8 +13,10 @@ use liboxen::opts::PaginateOpts;
 use liboxen::repositories;
 
 use crate::cmd::RunCmd;
-pub const NAME: &str = "log";
+
 pub struct LogCmd;
+
+const NAME: &str = "log";
 
 struct LogOptions {
     revision: Option<String>,
@@ -78,7 +80,7 @@ impl RunCmd for LogCmd {
             )
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         // Look up from the current dir for .oxen directory
         let repo = LocalRepository::from_current_dir()?;
 

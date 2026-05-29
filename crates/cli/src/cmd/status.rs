@@ -71,7 +71,7 @@ impl RunCmd for StatusCmd {
             )
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         let skip = args
             .get_one::<String>("skip")
             .expect("Must supply skip")

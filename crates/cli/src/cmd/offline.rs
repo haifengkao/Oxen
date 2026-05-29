@@ -2,7 +2,6 @@ use crate::cmd::RunCmd;
 use crate::helpers::check_repo_migration_needed;
 use async_trait::async_trait;
 use clap::{Arg, ArgMatches, Command};
-use liboxen::error::OxenError;
 use liboxen::model::LocalRepository;
 use liboxen::repositories;
 
@@ -28,7 +27,7 @@ impl RunCmd for OfflineCmd {
             )
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         let repo = LocalRepository::from_current_dir()?;
         check_repo_migration_needed(&repo)?;
 

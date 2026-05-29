@@ -53,7 +53,7 @@ impl RunCmd for BlameCmd {
             .arg(Arg::new("path").required(true).value_name("path"))
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         let repo = LocalRepository::from_current_dir()?;
         let revision = args
             .get_one::<String>("revision")

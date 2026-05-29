@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use clap::{Arg, ArgMatches, Command};
-use liboxen::error::OxenError;
 use liboxen::model::LocalRepository;
 use std::path::Path;
 
@@ -26,7 +25,7 @@ impl RunCmd for RootCmd {
             )
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         let repo = LocalRepository::from_current_dir()?;
         if args.get_flag("json") {
             println!("{}", serde_json::to_string(&root_json_value(&repo.path))?);

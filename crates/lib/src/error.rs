@@ -7,6 +7,7 @@ use aws_sdk_s3::error::BuildError;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
 use duckdb::arrow::error::ArrowError;
+use http::Uri;
 use std::fmt::Write;
 use std::io;
 use std::num::ParseIntError;
@@ -14,11 +15,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::task::JoinError;
 
+use crate::api::requests::RepoNew;
+use crate::command::migrate::Direction;
 use crate::config::repository_config::RepoConfigError;
 use crate::core::db::merkle_node::lmdb::LmdbError;
 use crate::core::db::merkle_node::merkle_node_db::MerkleDbError;
+use crate::model::MerkleHash;
 use crate::model::ParsedResource;
-use crate::model::RepoNew;
 use crate::model::Schema;
 use crate::model::Workspace;
 use crate::model::merkle_tree::merkle_hash::HexHash;
@@ -26,6 +29,7 @@ use crate::model::merkle_tree::node_type::InvalidMerkleTreeNodeType;
 
 pub mod path_buf_error;
 pub mod string_error;
+pub mod strum_ext;
 
 pub use crate::error::path_buf_error::PathBufError;
 pub use crate::error::string_error::StringError;
@@ -65,15 +69,35 @@ pub enum OxenError {
     #[error("Invalid repository or namespace name '{0}'. Must match [a-zA-Z0-9][a-zA-Z0-9_.-]+")]
     InvalidRepoName(StringError),
 
+    #[error(
+        "Invalid repository URL. Expecting 3 '/' parts to extract the namespace and repository name in the path of this URL: {0}"
+    )]
+    NoNamespaceRepoInUrl(Uri),
+
     /// When `get_fork_status` cannot obtain the fork status for a repository.
     #[error("No fork status found.")]
     ForkStatusNotFound,
+
+    #[error("A file already exists at the destination path: {0}")]
+    ForkDestinationExists(PathBuf),
+
+    #[error("Could not create or find repository [{repo_id}]: {err}\n{body}")]
+    FailCreateOrFindRemoteRepo {
+        repo_id: String,
+        err: serde_json::Error,
+        body: String,
+    },
 
     // TODO: Once all serialization paths use `*View` instead of `Workspace`, which requires `LocalRepository`
     //       to implement `Serializable`, then these *StoreNotInitialized errors can be deleted.,
     /// The [`MerkleStore`] or [`TransportMerkle`] for a [`LocalRepository`] was not initialized before access.
     #[error("Merkle store not initialized")]
     MerkleStoreNotInitialized,
+
+    /// A repository is misconfigured. Its Merkle tree store setting doesn't match the on-disk state.
+    /// The inner [`PathBuf`] is the local repository's root.
+    #[error("Repository {path} is configured with LMDB Merkle store but the on-disk LMDB files are not present.", path=.0.display())]
+    MisconfiguredMerkleLmdb(PathBuf),
 
     /// LMDB-backed Merkle store was requested on a repository configured for a
     /// virtual file system. LMDB requires a real, byte-addressable mmap target
@@ -88,6 +112,9 @@ pub enum OxenError {
     /// An error stemming from an invalid [`RepositoryConfig`] value encountered during parsing or saving.
     #[error("{0}")]
     RepoConfig(#[from] RepoConfigError),
+
+    #[error("Repository not found after attempted transfer")]
+    FailedTransfer,
 
     //
     // Remotes
@@ -139,6 +166,13 @@ pub enum OxenError {
     MissingFileName(StringError),
 
     //
+    // Diff errors
+    //
+    /// The file type is unsupported for data frame operations.
+    #[error("{0}")]
+    InvalidFileType(StringError),
+
+    //
     // Workspaces
     //
     /// The workspace wasn't found (either locally or on a remote server).
@@ -166,8 +200,22 @@ pub enum OxenError {
         source: Box<OxenError>,
     },
 
+    /// Adding a file into a workspace
+    #[error("{0}")]
+    ImportFileError(StringError),
+
+    /// An error encountered during SQL parsing.
+    #[error("{0}")]
+    SQLParseError(StringError),
+
     #[error("{0}")]
     WorkspaceNameIndex(#[from] crate::core::workspaces::workspace_name_index::WsError),
+
+    #[error("Not a real directory: {0}")]
+    NotADirectory(PathBuf),
+
+    #[error("No paths to add!")]
+    NoPathsToAdd,
 
     //
     // Resources (paths, uris, etc.)
@@ -200,6 +248,15 @@ pub enum OxenError {
     /// The version is invalid or unsupported.
     #[error("Invalid version: {0}")]
     InvalidVersion(StringError),
+
+    #[error("Unknown migration: {0}")]
+    UnknownMigration(String),
+
+    #[error("Migration unimplemented for direction: {0}")]
+    MigrationUnimplemented(Direction),
+
+    #[error("Migration failed to run")]
+    MigrationFailed,
 
     //
     // Version Store
@@ -270,7 +327,7 @@ pub enum OxenError {
     Lmdb(#[from] LmdbError),
 
     //
-    // Schema (dataframes)
+    // Schema
     //
     /// The schema is invalid or unsupported for dataframe operations.
     #[error("Invalid schema: {0}")]
@@ -279,18 +336,6 @@ pub enum OxenError {
     /// The schemas of the data frames are incompatible.
     #[error("Incompatible schemas: {0}")]
     IncompatibleSchemas(Box<Schema>),
-
-    /// The file type is unsupported for data frame operations.
-    #[error("{0}")]
-    InvalidFileType(StringError),
-
-    /// A column name already exists in the dataframe's schema and cannot be added again.
-    #[error("{0}")]
-    ColumnNameAlreadyExists(StringError),
-
-    /// A column name was requested in a dataframe, but no such column exists.
-    #[error("{0}")]
-    ColumnNameNotFound(StringError),
 
     /// An operation is not supported for the the dataframe.
     #[error("{0}")]
@@ -306,30 +351,14 @@ pub enum OxenError {
     ThumbnailingNotEnabled,
 
     //
-    // Dataframes
-    //
-    /// No rows were found for a given SQL query.
-    #[error("Query returned no rows")]
-    NoRowsFound,
-
-    /// An error encountered during dataframe operations.
-    /// Contains a human-readable description of the error.
-    #[error("{0}")]
-    DataFrameError(StringError),
-
-    /// Adding a file into a workspace
-    #[error("{0}")]
-    ImportFileError(StringError),
-
-    /// An error encountered during SQL parsing.
-    #[error("{0}")]
-    SQLParseError(StringError),
-
-    //
     //
     // Wrappers
     //
     //
+    /// An error encountered during dataframe operations.
+    #[error("{0}")]
+    DataFrameError(#[from] crate::core::db::data_frames::DataFrameError),
+
     /// An error encountered dealing with AWS
     #[error("AWS error: {0}")]
     AwsError(Box<dyn std::error::Error + Send + Sync>),
@@ -355,6 +384,16 @@ pub enum OxenError {
         dst: PathBuf,
         #[source]
         source: io::Error,
+    },
+
+    /// Content destined for `path` did not hash to the expected XXH3-128 digest. Returned by
+    /// the verified atomic-write helpers in `util::fs` so callers can distinguish "wrong content
+    /// arrived" from generic IO failures.
+    #[error("Hash mismatch writing {path:?}: expected {expected}, got {actual}")]
+    HashMismatch {
+        path: PathBuf,
+        expected: MerkleHash,
+        actual: MerkleHash,
     },
 
     /// Encountered when authentication fails. Contains the authentication error message.
@@ -550,7 +589,12 @@ pub enum OxenError {
     #[error("Unknown status [{0}]")]
     UnknownRemoteResponseStatus(StringError),
 
+    #[error("{0}")]
+    Strum(#[from] strum::ParseError),
+
+    //
     // Fallback
+    //
     // TODO: remove all uses of `Basic` and replace with specific errors.
     #[error("{0}")]
     Basic(StringError),
@@ -767,11 +811,6 @@ impl OxenError {
         OxenError::Upload(StringError::from(s))
     }
 
-    /// Make a new OxenError::RepoNotFound error.
-    pub fn repo_not_found(repo: RepoNew) -> Self {
-        OxenError::RepoNotFound(Box::new(repo))
-    }
-
     /// Make a new OxenError::FileImportError error.
     pub fn file_import_error(s: impl AsRef<str>) -> Self {
         OxenError::ImportFileError(StringError::from(s.as_ref()))
@@ -836,18 +875,6 @@ impl OxenError {
     pub fn invalid_file_type(file_type: impl AsRef<str>) -> OxenError {
         let err = format!("Invalid file type: {:?}", file_type.as_ref());
         OxenError::InvalidFileType(StringError::from(err))
-    }
-
-    /// Make a new OxenError::ColumnNameAlreadyExists error.
-    pub fn column_name_already_exists(column_name: &str) -> OxenError {
-        let err = format!("Column name already exists: {column_name:?}");
-        OxenError::ColumnNameAlreadyExists(StringError::from(err))
-    }
-
-    /// Make a new OxenError::ColumnNameNotFound error.
-    pub fn column_name_not_found(column_name: &str) -> OxenError {
-        let err = format!("Column name not found: {column_name:?}");
-        OxenError::ColumnNameNotFound(StringError::from(err))
     }
 
     /// Make a new OxenError::IncompatibleSchemas error.
@@ -1035,14 +1062,6 @@ impl OxenError {
 
     pub fn parse_error(value: impl AsRef<str>) -> OxenError {
         OxenError::basic_str(format!("Parse error: {:?}", value.as_ref()))
-    }
-
-    pub fn unknown_subcommand(parent: impl AsRef<str>, name: impl AsRef<str>) -> OxenError {
-        OxenError::basic_str(format!(
-            "Unknown {} subcommand '{}'",
-            parent.as_ref(),
-            name.as_ref()
-        ))
     }
 }
 

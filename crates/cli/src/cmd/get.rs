@@ -27,7 +27,7 @@ impl RunCmd for GetCmd {
             .arg_required_else_help(true)
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         let repo = LocalRepository::from_current_dir()?;
         check_repo_migration_needed(&repo)?;
         let paths = collect_paths(&repo, args)?;

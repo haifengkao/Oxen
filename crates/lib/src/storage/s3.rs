@@ -18,7 +18,7 @@ use tokio_stream::Stream;
 use tokio_util::io::StreamReader;
 
 use super::version_store::{LocalFilePath, VersionStore};
-use crate::constants::VERSION_FILE_NAME;
+use crate::constants::{STREAMING_BUF_SIZE, VERSION_FILE_NAME};
 use crate::storage::version_encoding::{
     VERSION_METADATA_FILE_NAME, VersionEncodingMetadata, decode_from_storage, encode_for_storage,
     should_buffer_for_compression,
@@ -29,6 +29,15 @@ use xxhash_rust::xxh3::Xxh3;
 
 /// AWS recommends uploading to S3 in a single PUT if filesize is <= 100 MB.
 const DEFAULT_ONESHOT_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Server-supplied S3 configuration carried separately from per-repo `StorageConfig`. The bucket is
+/// a server-wide setting (the server can rotate it without rewriting every repo's config), so it
+/// never appears in `.oxen/config.toml` — only in the server's TOML, then threaded through repo
+/// construction. Clients of liboxen pass `None` for this when no S3 backend is server-enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Opts {
+    pub bucket: String,
+}
 
 /// S3 implementation of version storage
 #[derive(Debug)]
@@ -532,18 +541,31 @@ impl VersionStore for S3VersionStore {
         }
     }
 
-    async fn store_version(&self, hash: &str, data: &[u8]) -> Result<(), OxenError> {
+    async fn store_version(&self, hash: &str, data: Bytes) -> Result<(), OxenError> {
+        let client = self.client().await?;
         log::debug!("Storing version to S3");
-        self.store_encoded_version(hash, data)
+        if should_buffer_for_compression(data.len() as u64) {
+            return self.store_encoded_version(hash, &data).await;
+        }
+        let key = self.generate_key(hash);
+
+        let body = ByteStream::from(data);
+        client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(body)
+            .send()
             .await
-            .map_err(|_| OxenError::Basic("failed to store version in S3".into()))
+            .map_err(|_| OxenError::Basic("failed to store version in S3".into()))?;
+        Ok(())
     }
 
     async fn store_version_derived(
         &self,
         orig_hash: &str,
         derived_filename: &str,
-        derived_data: &[u8],
+        derived_data: Bytes,
     ) -> Result<(), OxenError> {
         let client = self.client().await?;
         let key = format!("{}/{}", self.version_dir(orig_hash), derived_filename);
@@ -552,7 +574,7 @@ impl VersionStore for S3VersionStore {
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .body(ByteStream::from(derived_data.to_vec()))
+            .body(ByteStream::from(derived_data))
             .send()
             .await
             .map_err(|e| {
@@ -716,7 +738,7 @@ impl VersionStore for S3VersionStore {
         let file = File::create(dest_path)
             .await
             .map_err(|e| OxenError::basic_str(format!("Failed to create file: {e}")))?;
-        let mut writer = tokio::io::BufWriter::with_capacity(10 * 1024 * 1024, file);
+        let mut writer = tokio::io::BufWriter::with_capacity(STREAMING_BUF_SIZE, file);
 
         let mut stream = StreamReader::new(self.get_version_stream(hash).await?);
         tokio::io::copy_buf(&mut stream, &mut writer)
@@ -1278,7 +1300,10 @@ mod tests {
         let data = repeated_json_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let stored = read_s3_object(&store, store.generate_key(&hash)).await;
         assert!(s3_object_exists(&store, version_metadata_key(&store, &hash)).await);
@@ -1355,7 +1380,10 @@ mod tests {
         let data = incompressible_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let stored = read_s3_object(&store, store.generate_key(&hash)).await;
         assert!(!s3_object_exists(&store, version_metadata_key(&store, &hash)).await);
@@ -1370,7 +1398,10 @@ mod tests {
         let data = repeated_json_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let chunk = store.get_version_chunk(&hash, 32, 128).await.unwrap();
         assert_eq!(chunk, data[32..160]);
@@ -1433,7 +1464,10 @@ mod tests {
         let (store, _tmp, _server) = setup().await;
         let data = b"streamed to destination";
 
-        store.store_version("eeedef1234567890", data).await.unwrap();
+        store
+            .store_version("eeedef1234567890", Bytes::from_static(data))
+            .await
+            .unwrap();
 
         let dest_dir = async_tempfile::TempDir::new().await.unwrap();
         let dest_path = dest_dir.dir_path().join("subdir/output.bin");
@@ -1528,7 +1562,10 @@ mod tests {
         let hash = "abcdef1234567890abcdef1234567890";
 
         // Store main data + two chunks
-        store.store_version(hash, b"main data").await.unwrap();
+        store
+            .store_version(hash, Bytes::from_static(b"main data"))
+            .await
+            .unwrap();
         store
             .store_version_chunk(hash, 0, Bytes::from_static(b"chunk-0"))
             .await
@@ -1633,8 +1670,14 @@ mod tests {
         let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-        store.store_version(hash_a, b"a data").await.unwrap();
-        store.store_version(hash_b, b"b data").await.unwrap();
+        store
+            .store_version(hash_a, Bytes::from_static(b"a data"))
+            .await
+            .unwrap();
+        store
+            .store_version(hash_b, Bytes::from_static(b"b data"))
+            .await
+            .unwrap();
 
         store.delete_version(hash_a).await.unwrap();
 
@@ -1647,7 +1690,10 @@ mod tests {
         let (store, _tmp, _server) = setup().await;
         let hash = "abcdef1234567890abcdef1234567890";
         let data: Vec<u8> = (0..100u8).collect();
-        store.store_version(hash, &data).await.unwrap();
+        store
+            .store_version(hash, Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         let chunk = store.get_version_chunk(hash, 10, 20).await.unwrap();
         assert_eq!(chunk, data[10..30]);
@@ -1658,7 +1704,10 @@ mod tests {
         let (store, _tmp, _server) = setup().await;
         let hash = "abcdef1234567890abcdef1234567890";
         let data = b"hello world!";
-        store.store_version(hash, data).await.unwrap();
+        store
+            .store_version(hash, Bytes::from_static(data))
+            .await
+            .unwrap();
 
         let chunk = store.get_version_chunk(hash, 0, 5).await.unwrap();
         assert_eq!(&chunk[..], b"hello");
@@ -1677,7 +1726,10 @@ mod tests {
     async fn test_get_version_chunk_past_eof_errors() {
         let (store, _tmp, _server) = setup().await;
         let hash = "abcdef1234567890abcdef1234567890";
-        store.store_version(hash, b"small").await.unwrap();
+        store
+            .store_version(hash, Bytes::from_static(b"small"))
+            .await
+            .unwrap();
 
         let result = store.get_version_chunk(hash, 1000, 10).await;
         assert!(
@@ -1795,9 +1847,18 @@ mod tests {
         let (store, _tmp, _server) = setup().await;
 
         // Insert out of order; list_versions is documented to return sorted results.
-        store.store_version("cccc", b"c data").await.unwrap();
-        store.store_version("aaaa", b"a data").await.unwrap();
-        store.store_version("bbbb", b"b data").await.unwrap();
+        store
+            .store_version("cccc", Bytes::from_static(b"c data"))
+            .await
+            .unwrap();
+        store
+            .store_version("aaaa", Bytes::from_static(b"a data"))
+            .await
+            .unwrap();
+        store
+            .store_version("bbbb", Bytes::from_static(b"b data"))
+            .await
+            .unwrap();
 
         let versions = store.list_versions().await.unwrap();
         assert_eq!(versions, vec!["aaaa", "bbbb", "cccc"]);
@@ -1818,7 +1879,10 @@ mod tests {
         let (store, _tmp, _server) = setup().await;
 
         let hash = "abcdef1234567890abcdef1234567890";
-        store.store_version(hash, b"main").await.unwrap();
+        store
+            .store_version(hash, Bytes::from_static(b"main"))
+            .await
+            .unwrap();
         store
             .store_version_chunk(hash, 0, Bytes::from_static(b"chunk-0"))
             .await
@@ -1828,7 +1892,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .store_version_derived(hash, "thumb.jpg", b"thumbnail bytes")
+            .store_version_derived(hash, "thumb.jpg", Bytes::from_static(b"thumbnail bytes"))
             .await
             .unwrap();
 

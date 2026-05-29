@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::{VERSION_CHUNK_FILE_NAME, VERSION_CHUNKS_DIR, VERSION_FILE_NAME};
 use crate::error::OxenError;
+use crate::model::MerkleHash;
 use crate::storage::version_encoding::{
     VERSION_METADATA_FILE_NAME, VersionEncodingMetadata, decode_from_storage, encode_for_storage,
     read_metadata, should_buffer_for_compression, write_metadata,
@@ -116,9 +117,6 @@ impl VersionStore for LocalVersionStore {
         mut reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         size: u64,
     ) -> Result<(), OxenError> {
-        let version_dir = self.version_dir(hash);
-        fs::create_dir_all(&version_dir).await?;
-
         let version_path = self.version_path(hash);
 
         if !version_path.exists() {
@@ -127,22 +125,32 @@ impl VersionStore for LocalVersionStore {
                 reader.read_to_end(&mut data).await?;
                 self.store_encoded_version(hash, &data).await?;
             } else {
-                let mut file = File::create(&version_path).await?;
-                tokio::io::copy(&mut *reader, &mut file).await?;
+                let expected_hash: MerkleHash = hash.parse()?;
+                util::fs::atomic_write_from_async_reader_verified(
+                    &version_path,
+                    &mut *reader,
+                    expected_hash,
+                )
+                .await?;
             }
         }
 
         Ok(())
     }
 
-    async fn store_version(&self, hash: &str, data: &[u8]) -> Result<(), OxenError> {
-        let version_dir = self.version_dir(hash);
-        fs::create_dir_all(&version_dir).await?;
-
+    async fn store_version(&self, hash: &str, data: Bytes) -> Result<(), OxenError> {
         let version_path = self.version_path(hash);
 
         if !version_path.exists() {
-            self.store_encoded_version(hash, data).await?;
+            if should_buffer_for_compression(data.len() as u64) {
+                self.store_encoded_version(hash, &data).await?;
+            } else {
+                let expected_hash: MerkleHash = hash.parse()?;
+                tokio::task::spawn_blocking(move || {
+                    util::fs::atomic_write_to_path_verified(&version_path, &data, expected_hash)
+                })
+                .await??;
+            }
         }
 
         Ok(())
@@ -152,14 +160,13 @@ impl VersionStore for LocalVersionStore {
         &self,
         orig_hash: &str,
         derived_filename: &str,
-        derived_data: &[u8],
+        derived_data: Bytes,
     ) -> Result<(), OxenError> {
-        let dir = self.version_dir(orig_hash);
-        // TODO: Convert create_dir_all to async
-        util::fs::create_dir_all(&dir)?;
-        let path = dir.join(derived_filename);
-        fs::write(&path, derived_data).await?;
-        log::debug!("Saved derived version file {path:?}");
+        let path = self.version_dir(orig_hash).join(derived_filename);
+        let path_for_log = path.clone();
+        tokio::task::spawn_blocking(move || util::fs::atomic_write_to_path(&path, &derived_data))
+            .await??;
+        log::debug!("Saved derived version file {path_for_log:?}");
         Ok(())
     }
 
@@ -334,14 +341,14 @@ impl VersionStore for LocalVersionStore {
         offset: u64,
         data: Bytes,
     ) -> Result<(), OxenError> {
-        let chunk_dir = self.version_chunk_dir(hash, offset);
-        fs::create_dir_all(&chunk_dir).await?;
-
         let chunk_path = self.version_chunk_file(hash, offset);
 
-        if !chunk_path.exists() {
-            fs::write(&chunk_path, &data).await?;
+        if chunk_path.exists() {
+            return Ok(());
         }
+
+        tokio::task::spawn_blocking(move || util::fs::atomic_write_to_path(&chunk_path, &data))
+            .await??;
 
         Ok(())
     }
@@ -419,23 +426,40 @@ impl VersionStore for LocalVersionStore {
 
     async fn combine_version_chunks(&self, hash: &str) -> Result<(), OxenError> {
         let version_path = self.version_path(hash);
-        let mut output_file = File::create(&version_path).await?;
-
-        let chunks = self.list_version_chunks(hash).await?;
-        log::debug!("combine_version_chunks found {:?} chunks", chunks.len());
-
-        // Process each chunk
-        for chunk_offset in chunks {
-            let chunk_path = self.version_chunk_file(hash, chunk_offset);
-            let mut chunk_file = File::open(&chunk_path).await?;
-            tokio::io::copy(&mut chunk_file, &mut output_file).await?;
-        }
-
-        // Clean up chunks
         let chunks_dir = self.version_chunks_dir(hash);
-        if chunks_dir.exists() {
-            fs::remove_dir_all(&chunks_dir).await?;
-        }
+        let chunk_offsets = self.list_version_chunks(hash).await?;
+        let expected_hash: MerkleHash = hash.parse()?;
+        log::debug!(
+            "combine_version_chunks found {} chunks",
+            chunk_offsets.len()
+        );
+        let chunk_paths: Vec<PathBuf> = chunk_offsets
+            .iter()
+            .map(|offset| self.version_chunk_file(hash, *offset))
+            .collect();
+
+        // Run the full read-chunks + atomic-write + cleanup sequence in one `spawn_blocking`
+        // closure: chain each chunk file as a sync `Read` and pipe the concatenation through
+        // `atomic_write_from_reader_verified` so the rename only happens if the reassembled
+        // bytes hash to the file's canonical hash.
+        tokio::task::spawn_blocking(move || -> Result<(), OxenError> {
+            let mut combined: Box<dyn std::io::Read> = Box::new(std::io::empty());
+            for chunk_path in &chunk_paths {
+                let chunk_file = std::fs::File::open(chunk_path)?;
+                combined = Box::new(std::io::Read::chain(combined, chunk_file));
+            }
+            util::fs::atomic_write_from_reader_verified(
+                &version_path,
+                &mut combined,
+                expected_hash,
+            )?;
+
+            if chunks_dir.exists() {
+                std::fs::remove_dir_all(&chunks_dir)?;
+            }
+            Ok(())
+        })
+        .await??;
 
         Ok(())
     }
@@ -709,43 +733,46 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_get_version() {
         let (_temp_dir, store) = setup().await;
-        let hash = "abcdef1234567890";
         let data = b"test data";
+        let hash = hasher::hash_buffer(data);
 
         // Store the version
-        store.store_version(hash, data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from_static(data))
+            .await
+            .unwrap();
 
         // Verify the file exists with correct structure
-        let version_path = store.version_path(hash);
+        let version_path = store.version_path(&hash);
         assert!(version_path.exists());
-        assert_eq!(version_path.parent().unwrap(), store.version_dir(hash));
+        assert_eq!(version_path.parent().unwrap(), store.version_dir(&hash));
 
         // Get and verify the data
-        let retrieved = store.get_version(hash).await.unwrap();
+        let retrieved = store.get_version(&hash).await.unwrap();
         assert_eq!(retrieved, data);
     }
 
     #[tokio::test]
     async fn test_store_from_reader() {
         let (_temp_dir, store) = setup().await;
-        let hash = "abcdef1234567890";
         let data = b"test data from reader";
+        let hash = hasher::hash_buffer(data);
 
         // Create a cursor with the test data
         let cursor = Cursor::new(data.to_vec());
 
         // Store using the reader
         store
-            .store_version_from_reader(hash, Box::new(cursor), data.len() as u64)
+            .store_version_from_reader(&hash, Box::new(cursor), data.len() as u64)
             .await
             .unwrap();
 
         // Verify the file exists
-        let version_path = store.version_path(hash);
+        let version_path = store.version_path(&hash);
         assert!(version_path.exists());
 
         // Get and verify the data
-        let retrieved = store.get_version(hash).await.unwrap();
+        let retrieved = store.get_version(&hash).await.unwrap();
         assert_eq!(retrieved, data);
     }
 
@@ -792,7 +819,10 @@ mod tests {
         let data = repeated_json_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let stored_path = store.version_path(&hash);
         let stored_len = std::fs::metadata(&stored_path).unwrap().len();
@@ -820,7 +850,10 @@ mod tests {
         let data = repeated_json_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let stored_path = store.version_path(&hash);
         assert!(std::fs::read(&stored_path).unwrap() != data);
@@ -836,7 +869,10 @@ mod tests {
         let data = repeated_json_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let chunk = store.get_version_chunk(&hash, 32, 128).await.unwrap();
         assert_eq!(chunk, data[32..160]);
@@ -873,7 +909,10 @@ mod tests {
         let data = incompressible_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let stored_path = store.version_path(&hash);
         let stored_len = std::fs::metadata(&stored_path).unwrap().len();
@@ -889,7 +928,10 @@ mod tests {
         let data = repeated_json_bytes();
         let hash = hasher::hash_buffer(&data);
 
-        store.store_version(&hash, &data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from(data.clone()))
+            .await
+            .unwrap();
 
         let result = store.clean_corrupted_versions(false).await.unwrap();
         assert_eq!(result.scanned, 1);
@@ -901,32 +943,39 @@ mod tests {
     #[tokio::test]
     async fn test_version_exists() {
         let (_temp_dir, store) = setup().await;
-        let hash = "abcdef1234567890";
         let data = b"test data";
+        let hash = hasher::hash_buffer(data);
 
         // Check non-existent version
-        assert!(!store.version_exists(hash).await.unwrap());
+        assert!(!store.version_exists(&hash).await.unwrap());
 
         // Store and check again
-        store.store_version(hash, data).await.unwrap();
-        assert!(store.version_exists(hash).await.unwrap());
+        store
+            .store_version(&hash, Bytes::from_static(data))
+            .await
+            .unwrap();
+        assert!(store.version_exists(&hash).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_find_missing_versions_returns_only_absent_hashes() {
         let (_temp_dir, store) = setup().await;
-        let present = "aaaa1111aaaa1111";
-        let also_present = "bbbb2222bbbb2222";
+        let present_data = b"x";
+        let also_present_data = b"y";
+        let present = hasher::hash_buffer(present_data);
+        let also_present = hasher::hash_buffer(also_present_data);
         let absent = "cccc3333cccc3333";
-        store.store_version(present, b"x").await.unwrap();
-        store.store_version(also_present, b"y").await.unwrap();
+        store
+            .store_version(&present, Bytes::from_static(present_data))
+            .await
+            .unwrap();
+        store
+            .store_version(&also_present, Bytes::from_static(also_present_data))
+            .await
+            .unwrap();
 
         let missing = store
-            .find_missing_versions(&[
-                present.to_string(),
-                absent.to_string(),
-                also_present.to_string(),
-            ])
+            .find_missing_versions(&[present.clone(), absent.to_string(), also_present.clone()])
             .await
             .unwrap();
         assert_eq!(missing, vec![absent.to_string()]);
@@ -942,35 +991,40 @@ mod tests {
     #[tokio::test]
     async fn test_delete_version() {
         let (_temp_dir, store) = setup().await;
-        let hash = "abcdef1234567890";
         let data = b"test data";
+        let hash = hasher::hash_buffer(data);
 
         // Store and verify
-        store.store_version(hash, data).await.unwrap();
-        assert!(store.version_exists(hash).await.unwrap());
+        store
+            .store_version(&hash, Bytes::from_static(data))
+            .await
+            .unwrap();
+        assert!(store.version_exists(&hash).await.unwrap());
 
         // Delete and verify
-        store.delete_version(hash).await.unwrap();
-        assert!(!store.version_exists(hash).await.unwrap());
-        assert!(!store.version_dir(hash).exists());
+        store.delete_version(&hash).await.unwrap();
+        assert!(!store.version_exists(&hash).await.unwrap());
+        assert!(!store.version_dir(&hash).exists());
     }
 
     #[tokio::test]
     async fn test_list_versions() {
         let (_temp_dir, store) = setup().await;
-        // Insert out of order; list_versions is documented to return sorted results.
-        let hashes = vec!["cbcdef1234567890", "abcdef1234567890", "bbcdef1234567890"];
-        let data = b"test data";
+        // Insert with three distinct payloads so we get three distinct content-addressed
+        // hashes. `list_versions` is documented to return sorted results.
+        let payloads: [&[u8]; 3] = [b"alpha", b"bravo", b"charlie"];
+        let mut hashes: Vec<String> = payloads.iter().map(|d| hasher::hash_buffer(d)).collect();
 
-        for hash in &hashes {
-            store.store_version(hash, data).await.unwrap();
+        for (payload, hash) in payloads.iter().zip(&hashes) {
+            store
+                .store_version(hash, Bytes::from_static(payload))
+                .await
+                .unwrap();
         }
 
+        hashes.sort();
         let versions = store.list_versions().await.unwrap();
-        assert_eq!(
-            versions,
-            vec!["abcdef1234567890", "bbcdef1234567890", "cbcdef1234567890"]
-        );
+        assert_eq!(versions, hashes);
     }
 
     #[tokio::test]
@@ -1001,21 +1055,24 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_get_version_chunk() {
         let (_temp_dir, store) = setup().await;
-        let hash = "abcdef1234567890";
-        let offset = 0;
         let data = b"test chunk data";
+        let hash = hasher::hash_buffer(data);
+        let offset = 0;
         let size = data.len() as u64;
 
         // Store the chunk
-        store.store_version(hash, data).await.unwrap();
+        store
+            .store_version(&hash, Bytes::from_static(data))
+            .await
+            .unwrap();
 
         // Verify the file exists with correct structure
-        let file_path = store.version_path(hash);
+        let file_path = store.version_path(&hash);
         assert!(file_path.exists());
-        assert_eq!(file_path.parent().unwrap(), store.version_dir(hash));
+        assert_eq!(file_path.parent().unwrap(), store.version_dir(&hash));
 
         // Get and verify the data
-        let retrieved = store.get_version_chunk(hash, offset, size).await.unwrap();
+        let retrieved = store.get_version_chunk(&hash, offset, size).await.unwrap();
         assert_eq!(retrieved, data);
     }
 
@@ -1046,7 +1103,11 @@ mod tests {
 
         // Store derived
         store
-            .store_version_derived(orig_hash, derived_filename, derived_data)
+            .store_version_derived(
+                orig_hash,
+                derived_filename,
+                Bytes::from_static(derived_data),
+            )
             .await
             .unwrap();
 
@@ -1087,7 +1148,11 @@ mod tests {
 
         // Store and check again
         store
-            .store_version_derived(orig_hash, derived_filename, derived_data)
+            .store_version_derived(
+                orig_hash,
+                derived_filename,
+                Bytes::from_static(derived_data),
+            )
             .await
             .unwrap();
         assert!(

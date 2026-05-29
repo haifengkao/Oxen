@@ -11,12 +11,25 @@ mod value_structs;
 /// The [`MerkleWriter`] implementation.
 mod writer;
 
+/// The cache of open `LMDB` environments in the process.
+pub(crate) mod cache;
+
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+
+pub use cache::get_or_open;
+pub(in crate::core::db::merkle_node::lmdb) use lmdb_backend::DEFAULT_LMDB_MMAP_SIZE;
 pub use lmdb_backend::LmdbBackend;
-pub(crate) use lmdb_backend::lmdb_dir_location;
+pub(crate) use lmdb_backend::{OXEN_LMDB_MERKLE_DIR, lmdb_backend_options, lmdb_dir_location};
 
 use thiserror::Error;
 
-use crate::model::merkle_tree::{merkle_hash::HexHash, node_type::InvalidMerkleTreeNodeType};
+use crate::{
+    error::OxenError,
+    model::merkle_tree::{merkle_hash::HexHash, node_type::InvalidMerkleTreeNodeType},
+};
+use bytesize::ByteSize;
 
 /// Errors that the LMDB backend's operations can encounter.
 ///
@@ -69,6 +82,13 @@ pub enum LmdbError {
     #[error("Error writing LMDB Merkle store: {0}")]
     Write(heed::Error),
 
+    #[error("Error copying the LMDB on-disk file to {dst}: {error}")]
+    Copy {
+        dst: PathBuf,
+        #[source]
+        error: heed::Error,
+    },
+
     // ── Cross-table integrity ────────────────────────────────────────────────
     #[error("Missing node, have link for (hex) hash: {0}")]
     IntegrityNoNode(HexHash),
@@ -78,20 +98,67 @@ pub enum LmdbError {
 
     #[error("Stored a child for (hex) hash ({0}) but node for hash does not exist.")]
     IntegrityNoHash(HexHash),
+
+    // ── Initialization Errors ────────────────────────────────────────────────
+    #[error(
+        "Cannot create LMDB mmap file of size {0}: it is larger than this system's supported memory."
+    )]
+    InitMmap(ByteSize),
+
+    #[error("Cannot create an absolute path for the LMDB mmap file: {0}")]
+    InitAbs(Box<OxenError>), // TODO: update to FsError when that refactoring PR lands
+
+    #[error("Cannot create directory for LMDB's memory mapped file: {0}")]
+    InitDir(Box<OxenError>), // TODO: update to FsError when that refactoring PR lands
+}
+
+/// Uses and returns [`lmdb_test_root`], ensuring that the LMDB dir exists under .oxen/.
+#[cfg(test)]
+pub(crate) fn test_lmdb_repo_root(repo_root: &Path) -> std::io::Result<PathBuf> {
+    let test_root = lmdb_test_root(repo_root);
+    let env_dir = lmdb_dir_location(&test_root);
+    std::fs::create_dir_all(&env_dir)?;
+    Ok(test_root)
+}
+
+/// Map a test repo path to a per-repo directory under the OS temp dir.
+///
+/// The Windows CI runner mounts an ImDisk RAMDisk at `R:\test` and points
+/// `OXEN_TEST_RUN_DIR` there (see `.github/workflows/ci_test.yml`). ImDisk is a
+/// Win32-level emulation that does not fully implement the NT-level memory-section
+/// APIs LMDB depends on: `NtCreateSection` against a file on the ImDisk volume
+/// returns `STATUS_INVALID_DEVICE_REQUEST`, which `mdb_nt2win32` converts to
+/// `ERROR_INVALID_FUNCTION` (Win32 code 1). It surfaces here as
+/// `Lmdb(Access(Io(Os { code: 1, .. })))` and is reported as "Incorrect function.".
+/// `LmdbBackend` already documents `DO NOT USE ON A VIRTUAL FILE SYSTEM`; an ImDisk
+/// volume is exactly that.
+///
+/// Routing the env to the OS temp dir keeps it on the host's real filesystem
+/// (NTFS on Windows runners), where the NT memory-section APIs work normally.
+/// The mapping is stable per repo path so that callers that re-open with the
+/// same `repo_root` (e.g. `test_data_persists_across_env_reopen`) hit the same
+/// env on each open. The repo's UUID-named leaf keeps env paths unique across
+/// concurrent tests.
+#[cfg(test)]
+fn lmdb_test_root(repo_root: &Path) -> PathBuf {
+    let leaf = repo_root
+        .file_name()
+        .expect("test repo_root has a leaf component");
+    std::env::temp_dir().join("oxen-lmdb-tests").join(leaf)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        path::{Path, PathBuf},
-    };
+    use std::{collections::HashMap, path::Path};
 
-    use heed::EnvOpenOptions;
+    use bytesize::ByteSize;
     use time::OffsetDateTime;
 
     use crate::{
-        core::db::merkle_node::{LmdbBackend, lmdb::lmdb_backend::lmdb_dir_location},
+        core::db::merkle_node::{
+            LmdbBackend,
+            lmdb::{lmdb_backend_options, test_lmdb_repo_root},
+        },
         error::OxenError,
         model::{
             EntryDataType, LocalRepository, MerkleHash, MerkleTreeNodeType, TMerkleTreeNode,
@@ -106,51 +173,19 @@ mod tests {
         },
     };
 
-    /// Map a test repo path to a per-repo directory under the OS temp dir.
-    ///
-    /// The Windows CI runner mounts an ImDisk RAMDisk at `R:\test` and points
-    /// `OXEN_TEST_RUN_DIR` there (see `.github/workflows/ci_test.yml`). ImDisk is a
-    /// Win32-level emulation that does not fully implement the NT-level memory-section
-    /// APIs LMDB depends on: `NtCreateSection` against a file on the ImDisk volume
-    /// returns `STATUS_INVALID_DEVICE_REQUEST`, which `mdb_nt2win32` converts to
-    /// `ERROR_INVALID_FUNCTION` (Win32 code 1). It surfaces here as
-    /// `Lmdb(Access(Io(Os { code: 1, .. })))` and is reported as "Incorrect function.".
-    /// `LmdbBackend` already documents `DO NOT USE ON A VIRTUAL FILE SYSTEM`; an ImDisk
-    /// volume is exactly that.
-    ///
-    /// Routing the env to the OS temp dir keeps it on the host's real filesystem
-    /// (NTFS on Windows runners), where the NT memory-section APIs work normally.
-    /// The mapping is stable per repo path so that callers that re-open with the
-    /// same `repo_root` (e.g. `test_data_persists_across_env_reopen`) hit the same
-    /// env on each open. The repo's UUID-named leaf keeps env paths unique across
-    /// concurrent tests.
-    fn lmdb_test_root(repo_root: &Path) -> PathBuf {
-        let leaf = repo_root
-            .file_name()
-            .expect("test repo_root has a leaf component");
-        std::env::temp_dir().join("oxen-lmdb-tests").join(leaf)
-    }
-
-    /// Build a fresh [`LmdbBackend`] for a test [`LocalRepository`].
-    pub(in crate::core::db::merkle_node::lmdb) fn open_lmdb_backend(
-        repo: &LocalRepository,
-    ) -> LmdbBackend {
-        open_lmdb_at(repo.path.clone())
-    }
-
     /// Open the backend keyed by a `repo_root` — used to test persistence across env opens.
     ///
     /// The on-disk env lives under the OS temp dir, not under `repo_root` itself; see
     /// [`lmdb_test_root`] for why. heed (without `NO_SUB_DIR`) treats the env path as a
     /// directory it writes `data.mdb` + `lock.mdb` into, so the leaf must exist, and we
     /// create it here.
-    pub(in crate::core::db::merkle_node::lmdb) fn open_lmdb_at(repo_root: PathBuf) -> LmdbBackend {
-        let test_root = lmdb_test_root(&repo_root);
-        let env_dir = lmdb_dir_location(&test_root);
-        std::fs::create_dir_all(&env_dir).expect("env dir");
-
-        let mut opts = EnvOpenOptions::new();
-        opts.map_size(10 * 1024 * 1024);
+    pub(in crate::core::db::merkle_node::lmdb) fn open_lmdb_at(repo_root: &Path) -> LmdbBackend {
+        let test_root =
+            test_lmdb_repo_root(repo_root).expect("could not create test LMDB location");
+        // 10 MiB is plenty for the test workloads and lets dozens of
+        // independent test envs coexist without exhausting virtual memory.
+        let opts = lmdb_backend_options(ByteSize::mib(10))
+            .expect("could not initialize LMDB environment options");
         LmdbBackend::new(test_root, opts).expect("open lmdb backend")
     }
 
@@ -163,7 +198,7 @@ mod tests {
         F: FnOnce(&LocalRepository, &LmdbBackend) -> Result<(), OxenError> + std::panic::UnwindSafe,
     {
         crate::test::run_empty_local_repo_test(|repo| {
-            let backend = open_lmdb_backend(&repo);
+            let backend = open_lmdb_at(&repo.path);
             test_fn(&repo, &backend)
         })
     }

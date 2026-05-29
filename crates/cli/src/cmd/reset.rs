@@ -37,7 +37,7 @@ impl RunCmd for ResetCmd {
             )
     }
 
-    async fn run(&self, args: &ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &ArgMatches) -> Result<(), anyhow::Error> {
         let repository = LocalRepository::from_current_dir()?;
         check_repo_migration_needed(&repository)?;
 

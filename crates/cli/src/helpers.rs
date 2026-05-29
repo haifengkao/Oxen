@@ -1,5 +1,5 @@
 use liboxen::api;
-use liboxen::command::migrate::Migrate;
+use liboxen::command::migrate::ALL_MIGRATIONS;
 use liboxen::config::AuthConfig;
 use liboxen::constants;
 use liboxen::error::OxenError;
@@ -8,7 +8,6 @@ use liboxen::util::oxen_version::OxenVersion;
 
 use colored::Colorize;
 
-use std::collections::HashMap;
 use std::str::FromStr;
 
 pub fn get_scheme_and_host_or_default() -> Result<(String, String), OxenError> {
@@ -81,20 +80,16 @@ pub async fn check_remote_version_blocking(
     Ok(())
 }
 
-pub fn migrations() -> HashMap<String, Box<dyn Migrate>> {
-    liboxen::command::migrate::all_migrations()
-}
-
 pub fn check_repo_migration_needed(repo: &LocalRepository) -> Result<(), OxenError> {
-    let migrations = migrations();
-
-    let mut migrations_needed: Vec<Box<dyn Migrate>> = Vec::new();
-
-    for (_, migration) in migrations {
-        if migration.is_needed(repo)? {
-            migrations_needed.push(migration);
+    let migrations_needed = {
+        let mut migrations_needed = vec![];
+        for migration in ALL_MIGRATIONS {
+            if migration.is_needed(repo)? {
+                migrations_needed.push(migration);
+            }
         }
-    }
+        migrations_needed
+    };
 
     if migrations_needed.is_empty() {
         return Ok(());
@@ -110,4 +105,20 @@ pub fn check_repo_migration_needed(repo: &LocalRepository) -> Result<(), OxenErr
     Err(OxenError::MigrationRequired(
         "Error: Migration required".to_string().into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liboxen::test;
+
+    /// The LMDB merkle-store migration is optional: even on a file-backend repo
+    /// (where it's *applicable*), it must not appear in the auto-block list, or
+    /// every normal CLI operation would refuse to proceed. `run_empty_local_repo_test`
+    /// creates a file-backend repo by default — exactly the case we want to assert
+    /// stays unblocked.
+    #[test]
+    fn test_check_repo_migration_needed_ignores_optional_migrations() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test(|repo| check_repo_migration_needed(&repo))
+    }
 }

@@ -4516,8 +4516,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "liboxen"
-version = "0.50.0"
+version = "0.50.1"
 dependencies = [
+ "anyhow",
  "approx",
  "arrow",
  "astral-tokio-tar",
@@ -4575,6 +4576,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "os_path",
+ "page_size",
  "par-stream",
  "parking_lot",
  "pathdiff",
@@ -5444,8 +5446,9 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "oxen-cli"
-version = "0.50.0"
+version = "0.50.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bytesize",
  "chrono",
@@ -5471,7 +5474,7 @@ dependencies = [
 
 [[package]]
 name = "oxen-py"
-version = "0.50.0"
+version = "0.50.1"
 dependencies = [
  "bindgen 0.71.1",
  "cc",
@@ -5490,7 +5493,7 @@ dependencies = [
 
 [[package]]
 name = "oxen-server"
-version = "0.50.0"
+version = "0.50.1"
 dependencies = [
  "actix-http",
  "actix-multipart",
@@ -5522,10 +5525,13 @@ dependencies = [
  "sanitize-filename",
  "serde",
  "serde_json",
+ "strum 0.28.0",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-actix-web",
  "tracing-opentelemetry",

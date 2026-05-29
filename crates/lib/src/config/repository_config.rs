@@ -4,7 +4,7 @@ use strum::{Display, EnumIter, EnumString, IntoStaticStr, VariantArray, VariantN
 use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::constants::DEFAULT_VNODE_SIZE;
+use crate::constants::{DEFAULT_VNODE_SIZE, MIN_OXEN_VERSION};
 use crate::error::OxenError;
 use crate::model::{LocalRepository, Remote};
 use crate::storage::StorageConfig;
@@ -25,7 +25,10 @@ pub enum RepoConfigError {
     Write(Box<OxenError>),
 
     #[error("[RepositoryConfig] Unsupported Merkle store kind: {kind}. Expected one of {tokens:?}.", kind=.0, tokens=<MerkleStoreKind as VariantNames>::VARIANTS)]
-    UnknownMerkeKind(#[from] strum::ParseError),
+    UnknownMerkleKind(#[from] strum::ParseError),
+
+    #[error("Cannot obtain current directory.")]
+    CurDir,
 }
 
 /// A sort of registry for known [`MerkleStore`] implementations that can be used by [`LocalRepository`].
@@ -91,13 +94,16 @@ pub struct RepositoryConfig {
 }
 
 impl Default for RepositoryConfig {
+    /// Default matches what `oxen init` writes to a fresh repo's `config.toml`: the current
+    /// `MIN_OXEN_VERSION`, the default vnode size, the default Merkle store backend, and `None`
+    /// for every per-repo override.
     fn default() -> Self {
         RepositoryConfig {
             remote_name: None,
             remotes: Vec::new(),
             subtree_paths: None,
             depth: None,
-            min_version: None,
+            min_version: Some(MIN_OXEN_VERSION.to_string()),
             vnode_size: Some(DEFAULT_VNODE_SIZE),
             storage: None,
             vfs: None,
@@ -137,13 +143,23 @@ impl RepositoryConfig {
     /// Save a repository config to the specified file.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), RepoConfigError> {
         let toml = self.to_toml()?;
-        util::fs::write_to_path(&path, toml).map_err(|e| RepoConfigError::Write(Box::from(e)))?;
+        util::fs::atomic_write_to_path(path.as_ref(), toml.as_bytes())
+            .map_err(|e| RepoConfigError::Write(Box::from(e)))?;
         Ok(())
     }
 
     /// The repository config's virtual node size.
     pub fn vnode_size(&self) -> u64 {
         self.vnode_size.unwrap_or(DEFAULT_VNODE_SIZE)
+    }
+
+    /// Loads a repository config from the current active working directory.
+    pub(crate) fn from_current_dir() -> Result<Self, RepoConfigError> {
+        let Some(repo_dir) = util::fs::get_repo_root_from_current_dir() else {
+            return Err(RepoConfigError::CurDir);
+        };
+        let config_path = util::fs::config_filepath(&repo_dir);
+        RepositoryConfig::from_file(&config_path)
     }
 }
 

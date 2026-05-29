@@ -79,7 +79,7 @@ impl RunCmd for CatCmd {
             )
     }
 
-    async fn run(&self, args: &clap::ArgMatches) -> Result<(), OxenError> {
+    async fn run(&self, args: &clap::ArgMatches) -> Result<(), anyhow::Error> {
         let repository = LocalRepository::from_current_dir()?;
         let path = args.get_one::<String>("path").expect("Must supply path");
         let revision = args
