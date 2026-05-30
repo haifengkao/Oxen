@@ -722,6 +722,9 @@ impl VersionStore for S3VersionStore {
         tmp.write_all(&data)
             .await
             .map_err(|e| OxenError::basic_str(format!("Failed to write temp file: {e}")))?;
+        tmp.flush()
+            .await
+            .map_err(|e| OxenError::basic_str(format!("Failed to flush temp file: {e}")))?;
         Ok(LocalFilePath::Temp(tmp))
     }
 
@@ -744,6 +747,10 @@ impl VersionStore for S3VersionStore {
         tokio::io::copy_buf(&mut stream, &mut writer)
             .await
             .map_err(|e| OxenError::basic_str(format!("Failed to copy S3 stream to file: {e}")))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| OxenError::basic_str(format!("Failed to flush file: {e}")))?;
 
         Ok(())
     }

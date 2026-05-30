@@ -996,7 +996,15 @@ fn count_removed_entries(
 
     let dir_node = CommitMerkleTree::read_depth(repo, dir_hash, 1)?;
     if let Some(ref node) = dir_node {
-        for child in repositories::tree::list_files_and_folders(node)? {
+        let children = repositories::tree::list_files_and_folders(node)?;
+        if children.is_empty() {
+            // Directories are tracked entries. A missing tracked empty directory
+            // should be restorable even though it has no file children to count.
+            *removed_entries += 1;
+            return Ok(());
+        }
+
+        for child in children {
             if let EMerkleTreeNode::File(file_node) = &child.node {
                 let relative_file_path = relative_path.join(file_node.name());
                 if !offline_index.is_current(&relative_file_path, &file_node.hash().to_string())? {

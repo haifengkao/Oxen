@@ -88,6 +88,7 @@ impl LocalVersionStore {
 
     async fn store_encoded_version(&self, hash: &str, data: &[u8]) -> Result<(), OxenError> {
         let encoded = encode_for_storage(hash, data)?;
+        fs::create_dir_all(self.version_dir(hash)).await?;
         fs::write(self.version_path(hash), &encoded.bytes).await?;
         if let Some(metadata) = encoded.metadata {
             write_metadata(self.version_metadata_path(hash), &metadata).await?;
@@ -252,6 +253,9 @@ impl VersionStore for LocalVersionStore {
             tmp.write_all(&data)
                 .await
                 .map_err(|e| OxenError::basic_str(format!("Failed to write temp file: {e}")))?;
+            tmp.flush()
+                .await
+                .map_err(|e| OxenError::basic_str(format!("Failed to flush temp file: {e}")))?;
             return Ok(LocalFilePath::Temp(tmp));
         }
 
