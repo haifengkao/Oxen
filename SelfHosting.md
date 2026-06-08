@@ -78,10 +78,16 @@ The full schema for the file is a single `[storage]` table:
 [storage]
 backends = ["local", "s3"]   # required; first element is the server default
 s3_bucket = "my-oxen-bucket" # required iff "s3" is in backends
+s3_endpoint_url = "https://s3.example.com" # optional; for S3-compatible storage
+s3_region = "us-test-1"                    # optional; for S3-compatible storage
+s3_force_path_style = true                 # optional; for S3-compatible storage
 ```
 
 - **`backends`** — a list of which storage kinds this server is willing to host. The valid values are `"local"` (local-filesystem version storage) and `"s3"` (S3 version storage), spelled in lowercase. The first element is the server's default: when a client creates a new repo without specifying a kind, the server uses that. Each kind must appear at most once; the list must be non-empty.
 - **`s3_bucket`** — the S3 bucket the server uses for any S3-backed repo. Required when `"s3"` appears in `backends` and rejected when it doesn't. Each repo gets the prefix `{namespace}/{name}/` inside this bucket; the prefix is not configurable per repo.
+- **`s3_endpoint_url`** — optional S3-compatible endpoint URL. Leave unset for AWS S3.
+- **`s3_region`** — optional region override for S3-compatible storage.
+- **`s3_force_path_style`** — optional path-style addressing switch for S3-compatible storage. Defaults to `false`.
 
 Omitting the `[storage]` section entirely is equivalent to:
 
@@ -105,6 +111,16 @@ backends = ["local"]
 [storage]
 backends = ["s3"]
 s3_bucket = "oxen-prod-versions"
+```
+
+```toml
+# S3-compatible storage — new repos go to the configured compatible backend by default
+[storage]
+backends = ["s3"]
+s3_bucket = "my-oxen-bucket"
+s3_endpoint_url = "https://s3.example.com"
+s3_region = "us-test-1"
+s3_force_path_style = true
 ```
 
 ```toml

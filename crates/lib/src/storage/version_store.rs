@@ -434,7 +434,7 @@ pub fn create_version_store(
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| OxenError::S3PrefixUnresolvable(repo_dir.into()))?;
             let prefix = format!("{namespace}/{name}");
-            let store = S3VersionStore::new(opts.bucket.clone(), prefix);
+            let store = S3VersionStore::new_with_opts(opts.clone(), prefix);
             Ok(Arc::new(store))
         }
     }
@@ -470,6 +470,9 @@ mod tests {
         let repo_dir = PathBuf::from("/srv/oxen/test-ns/test-repo");
         let opts = S3Opts {
             bucket: "my-bucket".to_string(),
+            endpoint_url: None,
+            region: None,
+            force_path_style: false,
         };
         let store = create_version_store(&repo_dir, &s3_config(), Some(&opts))
             .expect("S3 store should construct when server opts are present");

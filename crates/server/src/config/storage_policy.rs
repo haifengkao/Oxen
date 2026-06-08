@@ -34,6 +34,12 @@ struct StoragePolicyRaw {
     backends: Vec<StorageKind>,
     #[serde(default)]
     s3_bucket: String,
+    #[serde(default)]
+    s3_endpoint_url: Option<String>,
+    #[serde(default)]
+    s3_region: Option<String>,
+    #[serde(default)]
+    s3_force_path_style: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +80,9 @@ impl TryFrom<StoragePolicyRaw> for StoragePolicy {
             }
             Some(S3Opts {
                 bucket: raw.s3_bucket,
+                endpoint_url: raw.s3_endpoint_url,
+                region: raw.s3_region,
+                force_path_style: raw.s3_force_path_style,
             })
         } else {
             // Orphan bucket (set when S3 isn't in backends) is silently dropped so
@@ -151,6 +160,9 @@ mod tests {
     fn s3_opts(bucket: &str) -> S3Opts {
         S3Opts {
             bucket: bucket.to_string(),
+            endpoint_url: None,
+            region: None,
+            force_path_style: false,
         }
     }
 
@@ -158,6 +170,9 @@ mod tests {
         StoragePolicyRaw {
             backends,
             s3_bucket: s3_bucket.to_string(),
+            s3_endpoint_url: None,
+            s3_region: None,
+            s3_force_path_style: false,
         }
     }
 
@@ -233,6 +248,28 @@ mod tests {
         let c = cfg(vec![StorageKind::Local], "orphan-bucket");
         assert!(c.local);
         assert!(c.s3.is_none());
+    }
+
+    #[test]
+    fn try_from_s3_preserves_s3_compatible_endpoint_settings() {
+        let c = StoragePolicy::try_from(StoragePolicyRaw {
+            backends: vec![StorageKind::S3],
+            s3_bucket: "example-bucket".to_string(),
+            s3_endpoint_url: Some("https://s3.example.com".to_string()),
+            s3_region: Some("us-test-1".to_string()),
+            s3_force_path_style: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            c.s3,
+            Some(S3Opts {
+                bucket: "example-bucket".to_string(),
+                endpoint_url: Some("https://s3.example.com".to_string()),
+                region: Some("us-test-1".to_string()),
+                force_path_style: true,
+            })
+        );
     }
 
     #[test]

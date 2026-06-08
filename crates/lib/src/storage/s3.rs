@@ -5,15 +5,20 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
-use aws_sdk_s3::{Client, config::Region, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client,
+    config::{Region, retry::RetryConfig, timeout::TimeoutConfig},
+    primitives::ByteStream,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 use log;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::fs::{File, create_dir_all};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::Stream;
 use tokio_util::io::StreamReader;
 
@@ -29,6 +34,12 @@ use xxhash_rust::xxh3::Xxh3;
 
 /// AWS recommends uploading to S3 in a single PUT if filesize is <= 100 MB.
 const DEFAULT_ONESHOT_SIZE: u64 = 100 * 1024 * 1024;
+const DEFAULT_S3_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_S3_OPERATION_ATTEMPT_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
+const DEFAULT_S3_MAX_CONCURRENT_WRITES: usize = 2;
+
+static S3_WRITE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Server-supplied S3 configuration carried separately from per-repo `StorageConfig`. The bucket is
 /// a server-wide setting (the server can rotate it without rewriting every repo's config), so it
@@ -37,6 +48,9 @@ const DEFAULT_ONESHOT_SIZE: u64 = 100 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3Opts {
     pub bucket: String,
+    pub endpoint_url: Option<String>,
+    pub region: Option<String>,
+    pub force_path_style: bool,
 }
 
 /// S3 implementation of version storage
@@ -45,6 +59,9 @@ pub struct S3VersionStore {
     client: OnceCell<Result<Arc<Client>, OxenError>>,
     bucket: String,
     prefix: String,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    force_path_style: bool,
     /// Threshold (bytes) below which we upload with a single PUT rather than a multipart upload.
     oneshot_size: u64,
 }
@@ -56,46 +73,94 @@ impl S3VersionStore {
     /// * `bucket` - S3 bucket name
     /// * `prefix` - Prefix for all objects in the bucket
     pub fn new(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self::new_with_opts(
+            S3Opts {
+                bucket: bucket.into(),
+                endpoint_url: None,
+                region: None,
+                force_path_style: false,
+            },
+            prefix,
+        )
+    }
+
+    pub fn new_with_opts(opts: S3Opts, prefix: impl Into<String>) -> Self {
         Self {
             client: OnceCell::new(),
-            bucket: bucket.into(),
+            bucket: opts.bucket,
             prefix: prefix.into(),
+            endpoint_url: opts.endpoint_url,
+            region: opts.region,
+            force_path_style: opts.force_path_style,
             oneshot_size: DEFAULT_ONESHOT_SIZE,
         }
+    }
+
+    #[cfg(test)]
+    pub fn endpoint_url(&self) -> Option<&str> {
+        self.endpoint_url.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn force_path_style(&self) -> bool {
+        self.force_path_style
     }
 
     pub async fn client(&self) -> Result<Arc<Client>, OxenError> {
         let result_ref = self
             .client
             .get_or_init(|| async {
-                // Create a temp client to get the bucket region
-                let region_provider = RegionProviderChain::default_provider().or_else("us-west-1");
+                let explicit_region = self.region.clone().map(Region::new);
+                let region_provider = RegionProviderChain::first_try(explicit_region)
+                    .or_default_provider()
+                    .or_else("us-west-1");
 
                 let base_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(region_provider)
                     .load()
                     .await;
-                let tmp_client = Client::new(&base_config);
 
-                let detected_region = tmp_client
-                    .get_bucket_location()
-                    .bucket(&self.bucket)
-                    .send()
-                    .await
-                    .map_err(|err| {
-                        OxenError::basic_str(format!("Failed to get bucket location: {err:?}"))
-                    })?
-                    .location_constraint()
-                    .map(|loc| loc.as_str().to_string())
-                    .unwrap_or("us-east-1".to_string());
+                let real_config = if self.region.is_none() && self.endpoint_url.is_none() {
+                    // Create a temp client to get the AWS bucket region when talking to AWS S3.
+                    let tmp_client = Client::new(&base_config);
 
-                // Construct the client with the detected bucket region
-                let real_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(Region::new(detected_region))
-                    .load()
-                    .await;
+                    let detected_region = tmp_client
+                        .get_bucket_location()
+                        .bucket(&self.bucket)
+                        .send()
+                        .await
+                        .map_err(|err| {
+                            OxenError::basic_str(format!("Failed to get bucket location: {err:?}"))
+                        })?
+                        .location_constraint()
+                        .map(|loc| loc.as_str().to_string())
+                        .unwrap_or("us-east-1".to_string());
 
-                Ok::<Arc<Client>, OxenError>(Arc::new(Client::new(&real_config)))
+                    aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .region(Region::new(detected_region))
+                        .load()
+                        .await
+                } else {
+                    base_config
+                };
+
+                let mut s3_config = aws_sdk_s3::config::Builder::from(&real_config);
+                s3_config = s3_config
+                    .timeout_config(s3_timeout_config())
+                    .retry_config(s3_retry_config());
+                if let Some(endpoint_url) = &self.endpoint_url {
+                    s3_config = s3_config.endpoint_url(endpoint_url);
+                }
+                if self.force_path_style {
+                    s3_config = s3_config.force_path_style(true);
+                }
+
+                Ok::<Arc<Client>, OxenError>(Arc::new(Client::from_conf(s3_config.build())))
             })
             .await;
 
@@ -113,6 +178,9 @@ impl S3VersionStore {
             client: cell,
             bucket,
             prefix,
+            endpoint_url: None,
+            region: None,
+            force_path_style: false,
             oneshot_size: DEFAULT_ONESHOT_SIZE,
         }
     }
@@ -213,6 +281,7 @@ impl S3VersionStore {
 
     async fn put_object_bytes(&self, key: String, data: Vec<u8>) -> Result<(), OxenError> {
         let client = self.client().await?;
+        let _permit = acquire_s3_write_permit().await?;
         client
             .put_object()
             .bucket(&self.bucket)
@@ -316,6 +385,64 @@ impl S3VersionStore {
     }
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn s3_timeout_config() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(env_u64(
+            "OXEN_S3_CONNECT_TIMEOUT_SECS",
+            DEFAULT_S3_CONNECT_TIMEOUT_SECS,
+        )))
+        .operation_attempt_timeout(Duration::from_secs(env_u64(
+            "OXEN_S3_OPERATION_ATTEMPT_TIMEOUT_SECS",
+            DEFAULT_S3_OPERATION_ATTEMPT_TIMEOUT_SECS,
+        )))
+        .build()
+}
+
+fn s3_retry_config() -> RetryConfig {
+    RetryConfig::standard()
+        .with_max_attempts(env_u32("OXEN_S3_MAX_ATTEMPTS", DEFAULT_S3_MAX_ATTEMPTS))
+}
+
+fn s3_max_concurrent_writes() -> usize {
+    env_usize(
+        "OXEN_S3_MAX_CONCURRENT_WRITES",
+        DEFAULT_S3_MAX_CONCURRENT_WRITES,
+    )
+}
+
+async fn acquire_s3_write_permit() -> Result<OwnedSemaphorePermit, OxenError> {
+    S3_WRITE_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(s3_max_concurrent_writes())))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| OxenError::basic_str(format!("S3 write limiter closed: {e}")))
+}
+
 #[async_trait]
 impl VersionStore for S3VersionStore {
     async fn init(&self) -> Result<(), OxenError> {
@@ -328,6 +455,7 @@ impl VersionStore for S3VersionStore {
                 let test_key = format!("{}/_permission_check", self.prefix);
                 let body = ByteStream::from("permission-check".as_bytes().to_vec());
 
+                let _permit = acquire_s3_write_permit().await?;
                 match client
                     .put_object()
                     .bucket(&self.bucket)
@@ -550,6 +678,7 @@ impl VersionStore for S3VersionStore {
         let key = self.generate_key(hash);
 
         let body = ByteStream::from(data);
+        let _permit = acquire_s3_write_permit().await?;
         client
             .put_object()
             .bucket(&self.bucket)
@@ -570,6 +699,7 @@ impl VersionStore for S3VersionStore {
         let client = self.client().await?;
         let key = format!("{}/{}", self.version_dir(orig_hash), derived_filename);
 
+        let _permit = acquire_s3_write_permit().await?;
         client
             .put_object()
             .bucket(&self.bucket)
@@ -764,6 +894,7 @@ impl VersionStore for S3VersionStore {
         let client = self.client().await?;
         let key = self.chunk_key(hash, offset);
 
+        let _permit = acquire_s3_write_permit().await?;
         client
             .put_object()
             .bucket(&self.bucket)
@@ -1080,6 +1211,7 @@ async fn upload_part(
     part_num: i32,
     data: Vec<u8>,
 ) -> Result<CompletedPart, OxenError> {
+    let _permit = acquire_s3_write_permit().await?;
     let resp = client
         .upload_part()
         .bucket(bucket)
@@ -1155,9 +1287,52 @@ mod tests {
     use futures::StreamExt;
     use rand::rngs::StdRng;
     use rand::{RngCore, SeedableRng};
+    use serial_test::serial;
+    use std::env;
     use std::net::SocketAddr;
     use std::path::Path;
     use tokio::net::TcpListener;
+
+    #[test]
+    #[serial]
+    fn s3_timeout_config_uses_env_overrides() {
+        unsafe {
+            env::set_var("OXEN_S3_CONNECT_TIMEOUT_SECS", "45");
+            env::set_var("OXEN_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", "900");
+        }
+
+        let config = s3_timeout_config();
+
+        assert_eq!(config.connect_timeout(), Some(Duration::from_secs(45)));
+        assert_eq!(
+            config.operation_attempt_timeout(),
+            Some(Duration::from_secs(900))
+        );
+
+        unsafe {
+            env::remove_var("OXEN_S3_CONNECT_TIMEOUT_SECS");
+            env::remove_var("OXEN_S3_OPERATION_ATTEMPT_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn s3_retry_and_concurrency_config_use_env_overrides() {
+        unsafe {
+            env::set_var("OXEN_S3_MAX_ATTEMPTS", "12");
+            env::set_var("OXEN_S3_MAX_CONCURRENT_WRITES", "3");
+        }
+
+        let retry_config = s3_retry_config();
+
+        assert_eq!(retry_config.max_attempts(), 12);
+        assert_eq!(s3_max_concurrent_writes(), 3);
+
+        unsafe {
+            env::remove_var("OXEN_S3_MAX_ATTEMPTS");
+            env::remove_var("OXEN_S3_MAX_CONCURRENT_WRITES");
+        }
+    }
 
     async fn setup() -> (
         S3VersionStore,
@@ -1905,5 +2080,22 @@ mod tests {
 
         let versions = store.list_versions().await.unwrap();
         assert_eq!(versions, vec![hash]);
+    }
+
+    #[test]
+    fn new_with_opts_preserves_s3_compatible_endpoint_settings() {
+        let store = S3VersionStore::new_with_opts(
+            S3Opts {
+                bucket: "example-bucket".to_string(),
+                endpoint_url: Some("https://s3.example.com".to_string()),
+                region: Some("us-test-1".to_string()),
+                force_path_style: true,
+            },
+            "test/repo",
+        );
+
+        assert_eq!(store.endpoint_url(), Some("https://s3.example.com"));
+        assert_eq!(store.region(), Some("us-test-1"));
+        assert!(store.force_path_style());
     }
 }

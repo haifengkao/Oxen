@@ -33,12 +33,18 @@ mod tests {
             [storage]
             backends = ["local", "s3"]
             s3_bucket = "my-bucket"
+            s3_endpoint_url = "https://s3.example.com"
+            s3_region = "us-test-1"
+            s3_force_path_style = true
         "#;
         let f: Config = toml::from_str(toml_str).unwrap();
         let expected: StoragePolicy = toml::from_str(
             r#"
             backends = ["local", "s3"]
             s3_bucket = "my-bucket"
+            s3_endpoint_url = "https://s3.example.com"
+            s3_region = "us-test-1"
+            s3_force_path_style = true
         "#,
         )
         .unwrap();
