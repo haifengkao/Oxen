@@ -55,6 +55,11 @@ impl PushProgress {
         self.sync_progress.get_num_bytes()
     }
 
+    #[cfg(test)]
+    pub fn is_finished(&self) -> bool {
+        self.sync_progress.is_finished()
+    }
+
     pub fn finish(&self) {
         self.sync_progress.finish();
     }

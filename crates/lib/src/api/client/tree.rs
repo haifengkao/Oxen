@@ -126,7 +126,6 @@ pub async fn create_nodes(
         .await?;
     let body = client::parse_json_body(&url, res).await?;
     log::debug!("upload node complete {body}");
-    progress.finish();
 
     // Surface any pack error after the upload completes (the duplex reader reaching EOF
     // signals pack end-of-stream; panics and Result::Err come through the join handle).
@@ -492,7 +491,10 @@ pub async fn mark_nodes_as_synced(
 #[cfg(test)]
 mod tests {
     use crate::api;
+    use crate::constants;
+    use crate::core::progress::push_progress::PushProgress;
     use crate::error::OxenError;
+    use crate::model::{Remote, RemoteRepository};
     use crate::opts::FetchOpts;
     use crate::repositories;
     use crate::test;
@@ -500,6 +502,7 @@ mod tests {
 
     use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_has_node() -> Result<(), OxenError> {
@@ -510,6 +513,55 @@ mod tests {
             assert!(has_node);
 
             Ok(remote_repo)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_create_nodes_does_not_finish_shared_push_progress() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|local_repo| async move {
+            let mut server = mockito::Server::new_async().await;
+            let namespace = constants::DEFAULT_NAMESPACE.to_string();
+            let name = local_repo.dirname();
+
+            let remote_repo = RemoteRepository {
+                namespace: namespace.clone(),
+                name: name.clone(),
+                remote: Remote {
+                    name: constants::DEFAULT_REMOTE_NAME.to_string(),
+                    url: format!("{}/{namespace}/{name}", server.url()),
+                },
+                min_version: None,
+                is_empty: false,
+            };
+
+            let path = format!("/api/repos/{namespace}/{name}/tree/nodes");
+            let mock_create_nodes = server
+                .mock("POST", &path[..])
+                .with_status(200)
+                .with_body(serde_json::to_string(
+                    &crate::view::StatusMessage::resource_created(),
+                )?)
+                .create_async()
+                .await;
+
+            let commit = repositories::commits::head_commit(&local_repo)?;
+            let progress = Arc::new(PushProgress::new_with_totals(0, 0));
+            api::client::tree::create_nodes(
+                &local_repo,
+                &remote_repo,
+                HashSet::from([commit.hash()?]),
+                &progress,
+            )
+            .await?;
+
+            mock_create_nodes.assert_async().await;
+            assert!(
+                !progress.is_finished(),
+                "create_nodes should not finish the shared push progress bar"
+            );
+
+            Ok(())
         })
         .await
     }
