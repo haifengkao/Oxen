@@ -138,6 +138,11 @@ impl SyncProgress {
         self.byte_counter.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub fn is_finished(&self) -> bool {
+        self.progress_bar.is_finished()
+    }
+
     pub fn finish(&self) {
         self.progress_bar.finish_and_clear();
     }

@@ -274,6 +274,7 @@ async fn list_and_push_missing_files(
     ));
 
     push_entries(repo, remote_repo, &missing_files, head_commit, &progress).await?;
+    progress.finish();
     Ok(())
 }
 
@@ -521,6 +522,8 @@ async fn push_commits(
             },
         )
         .await;
+
+    progress.finish();
 
     let errors = errors.lock().await;
     if !errors.is_empty() {
