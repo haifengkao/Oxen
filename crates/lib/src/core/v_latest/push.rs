@@ -98,17 +98,36 @@ async fn push_to_new_branch(
     commit: &Commit,
     opts: &PushOpts,
 ) -> Result<(), OxenError> {
-    // We need to find all the commits that need to be pushed
-    let history = repositories::commits::list_from(repo, &commit.id)?;
+    // New remote branches must be crash-resumable. Previously we uploaded the
+    // full history first and created the branch ref at the end; any interrupted
+    // push left the server with commits but no branch, making retries fail while
+    // resolving HEAD/main. Advance the remote branch only after each commit has
+    // fully synced so the next push can resume from the last good commit.
+    let mut history = repositories::commits::list_from(repo, &commit.id)?;
+    history.reverse();
 
-    // Find the latest remote commit to use as a base for filtering out existing nodes
-    let latest_remote_commit = find_latest_remote_commit(repo, remote_repo).await?;
+    let mut latest_remote_commit = find_latest_remote_commit(repo, remote_repo).await?;
+    let mut remote_branch_created = false;
 
-    // Push the commits
-    push_commits(repo, remote_repo, latest_remote_commit, history, opts).await?;
+    for commit in history {
+        push_commits(
+            repo,
+            remote_repo,
+            latest_remote_commit.clone(),
+            vec![commit.clone()],
+            opts,
+        )
+        .await?;
 
-    // Create the remote branch from the commit
-    api::client::branches::create_from_commit(remote_repo, &branch.name, commit).await?;
+        if remote_branch_created {
+            api::client::branches::update(remote_repo, &branch.name, &commit).await?;
+        } else {
+            api::client::branches::create_from_commit(remote_repo, &branch.name, &commit).await?;
+            remote_branch_created = true;
+        }
+
+        latest_remote_commit = Some(commit);
+    }
 
     Ok(())
 }
@@ -888,5 +907,71 @@ async fn find_latest_remote_commit(
     } else {
         // No branches found
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api;
+    use crate::command;
+    use crate::constants::{DEFAULT_BRANCH_NAME, DEFAULT_REMOTE_NAME};
+    use crate::error::OxenError;
+    use crate::model::{Commit, LocalRepository};
+    use crate::opts::PushOpts;
+    use crate::repositories;
+    use crate::test;
+
+    #[tokio::test]
+    async fn test_new_branch_push_leaves_resumable_branch_after_later_commit_failure()
+    -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|mut repo| async move {
+            let first_path = repo.path.join("first.txt");
+            let first_path = test::write_txt_file_to_path(first_path, "first")?;
+            repositories::add(&repo, &first_path).await?;
+            let first_commit = repositories::commit(&repo, "first commit")?;
+
+            let second_path = repo.path.join("second.txt");
+            let second_path = test::write_txt_file_to_path(second_path, "second")?;
+            repositories::add(&repo, &second_path).await?;
+            let second_commit = repositories::commit(&repo, "second commit")?;
+
+            let remote_repo = test::create_remote_repo(&repo).await?;
+            let remote = test::repo_remote_url_from(&repo.dirname());
+            command::config::set_remote(&mut repo, DEFAULT_REMOTE_NAME, &remote)?;
+
+            delete_entry_version(&repo, &second_commit, "second.txt").await?;
+
+            let opts = PushOpts {
+                remote: DEFAULT_REMOTE_NAME.to_string(),
+                branch: DEFAULT_BRANCH_NAME.to_string(),
+                ..Default::default()
+            };
+            let result = repositories::push::push_remote_branch(&repo, &opts).await;
+            assert!(result.is_err());
+
+            let remote_branch =
+                api::client::branches::get_by_name(&remote_repo, DEFAULT_BRANCH_NAME).await?;
+            assert_eq!(
+                remote_branch.map(|branch| branch.commit_id),
+                Some(first_commit.id)
+            );
+
+            api::client::repositories::delete(&remote_repo).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_entry_version(
+        repo: &LocalRepository,
+        commit: &Commit,
+        path: &str,
+    ) -> Result<(), OxenError> {
+        let entries = repositories::entries::list_for_commit(repo, commit)?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path == std::path::PathBuf::from(path))
+            .ok_or_else(|| OxenError::basic_str(format!("expected commit to contain {path}")))?;
+        repo.version_store().delete_version(&entry.hash).await
     }
 }
