@@ -219,6 +219,47 @@ This enables:
 - **FFmpeg thumbnails** (`ffmpeg`) -- generate video/image thumbnails via FFmpeg (requires FFmpeg libraries installed on the host).
 - **Performance logging** (`perf-logging`) -- additional timing instrumentation for internal operations.
 
+### Self-Hosted Large Dataset Pushes
+
+When pushing large datasets to a self-hosted `oxen-server`, use a release CLI built from the same source revision as the server. Avoid mixing an older Homebrew CLI with a newer local server while testing push/resume behavior.
+
+Build the release CLI:
+
+```bash
+cargo build --release -p oxen-cli
+target/release/oxen --version
+```
+
+For unstable long-lived network paths, prefer smaller, retryable requests over simply increasing the timeout. This is a conservative push profile:
+
+```bash
+caffeinate -dimsu env \
+  OXEN_NUM_THREADS=1 \
+  OXEN_TIMEOUT_SECS=3600 \
+  OXEN_NUM_RETRIES=10 \
+  OXEN_STREAM_SEGMENT_SIZE=524288 \
+  OXEN_PUSH_SMALL_BATCH_MAX_FILES=8 \
+  OXEN_PUSH_TREE_NODE_BATCH_SIZE=1000 \
+  target/release/oxen push origin main
+```
+
+The environment variables above tune the client-side push behavior:
+
+- `OXEN_NUM_THREADS`: limits concurrent upload workers.
+- `OXEN_TIMEOUT_SECS`: request timeout in seconds.
+- `OXEN_NUM_RETRIES`: retry count for retryable upload failures.
+- `OXEN_STREAM_SEGMENT_SIZE`: threshold and segment size for streamed large-file uploads.
+- `OXEN_PUSH_SMALL_BATCH_MAX_FILES`: maximum small files in one `/versions` multipart request.
+- `OXEN_PUSH_TREE_NODE_BATCH_SIZE`: maximum merkle nodes in one `/tree/nodes` upload request.
+
+If the source machine is unreliable, first copy the dataset to the server host with a resumable file-transfer tool, then run the patched release CLI locally on the server host:
+
+```bash
+rsync -avh --partial --info=progress2 /path/to/dataset/ user@server:/path/to/dataset/
+```
+
+This removes the source machine's Wi-Fi, VPN, and sleep behavior from the long `oxen push` path.
+
 Without `--features production`, the default build excludes OTel dependencies and FFmpeg support, keeping the binary smaller for local development.
 
 ## Logging
