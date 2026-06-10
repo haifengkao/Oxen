@@ -8,6 +8,7 @@ use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 
 use crate::api;
 use crate::api::client;
+use crate::constants;
 use crate::core::progress::push_progress::PushProgress;
 use crate::core::v_latest::index::CommitMerkleTree;
 use crate::error::OxenError;
@@ -88,6 +89,23 @@ pub async fn create_nodes(
     let estimated_upload_bytes = local_repo.merkle_transport()?.raw_byte_count(&nodes);
     progress.inc_total_bytes(estimated_upload_bytes);
 
+    let batches = node_upload_batches(nodes, constants::push_tree_node_batch_size());
+    let total_batches = batches.len();
+    for (idx, batch) in batches.into_iter().enumerate() {
+        progress.set_message(format!("Pushing {n} nodes ({}/{total_batches})", idx + 1));
+        create_nodes_batch(local_repo, remote_repo, batch, progress).await?;
+    }
+
+    Ok(())
+}
+
+async fn create_nodes_batch(
+    local_repo: &LocalRepository,
+    remote_repo: &RemoteRepository,
+    nodes: HashSet<MerkleHash>,
+    progress: &Arc<PushProgress>,
+) -> Result<(), OxenError> {
+    let n = nodes.len();
     // Pack -> duplex writer (sync) -> duplex reader (async) -> HTTP body stream.
     // 64 KiB duplex buffer mirrors the server-side streaming pattern in
     // `crates/server/src/controllers/versions.rs`.
@@ -115,7 +133,7 @@ pub async fn create_nodes(
     let uri = "/tree/nodes".to_string();
     let url = api::endpoint::url_from_repo(remote_repo, &uri)?;
     let client = client::builder_for_url(&url)?
-        .timeout(time::Duration::from_secs(120))
+        .timeout(time::Duration::from_secs(constants::timeout()))
         .build()?;
     log::debug!("uploading {n} nodes to {url}");
 
@@ -135,6 +153,28 @@ pub async fn create_nodes(
     })??;
 
     Ok(())
+}
+
+fn node_upload_batches(
+    nodes: HashSet<MerkleHash>,
+    max_nodes_per_batch: usize,
+) -> Vec<HashSet<MerkleHash>> {
+    let max_nodes_per_batch = max_nodes_per_batch.max(1);
+    let mut batches = Vec::new();
+    let mut current = HashSet::new();
+
+    for node in nodes {
+        if current.len() >= max_nodes_per_batch {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.insert(node);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
 }
 
 /// Download a node from the remote repository merkle tree by hash
@@ -494,7 +534,7 @@ mod tests {
     use crate::constants;
     use crate::core::progress::push_progress::PushProgress;
     use crate::error::OxenError;
-    use crate::model::{Remote, RemoteRepository};
+    use crate::model::{MerkleHash, Remote, RemoteRepository};
     use crate::opts::FetchOpts;
     use crate::repositories;
     use crate::test;
@@ -503,6 +543,17 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn test_node_upload_batches_respect_max_nodes_per_batch() {
+        let nodes: HashSet<MerkleHash> = (0..7).map(MerkleHash::new).collect();
+
+        let batches = super::node_upload_batches(nodes, 3);
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.len() <= 3));
+        assert_eq!(batches.iter().map(HashSet::len).sum::<usize>(), 7);
+    }
 
     #[tokio::test]
     async fn test_has_node() -> Result<(), OxenError> {

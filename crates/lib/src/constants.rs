@@ -191,6 +191,12 @@ pub const MAX_CONCURRENT_UPLOADS: usize = 30;
 /// check many hashes at once. Sized for network HEAD operations rather than
 /// CPU work, so it's higher than `DEFAULT_NUM_WORKERS`.
 pub const MAX_CONCURRENT_VERSION_PROBES: usize = 32;
+/// Maximum number of small files to include in a single push `/versions`
+/// multipart request. Tiny files can make a byte-limited batch contain hundreds
+/// of S3 writes server-side, turning one HTTP request into a long-lived request.
+pub const DEFAULT_PUSH_SMALL_BATCH_MAX_FILES: usize = 32;
+/// Maximum number of merkle nodes to include in one push `/tree/nodes` upload.
+pub const DEFAULT_PUSH_TREE_NODE_BATCH_SIZE: usize = 5000;
 // Limit zip file downloads to batches of size N
 /// Limit zip file downloads to batches of size N
 pub const MAX_ZIP_DOWNLOAD_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
@@ -254,6 +260,28 @@ pub fn timeout() -> u64 {
         // Environment variable not set, use default
         DEFAULT_TIMEOUT_SECS
     }
+}
+
+pub fn push_small_batch_max_files() -> usize {
+    env_usize_or_default(
+        "OXEN_PUSH_SMALL_BATCH_MAX_FILES",
+        DEFAULT_PUSH_SMALL_BATCH_MAX_FILES,
+    )
+}
+
+pub fn push_tree_node_batch_size() -> usize {
+    env_usize_or_default(
+        "OXEN_PUSH_TREE_NODE_BATCH_SIZE",
+        DEFAULT_PUSH_TREE_NODE_BATCH_SIZE,
+    )
+}
+
+fn env_usize_or_default(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Returns the active streamed-transfer segment size (see [`STREAM_SEGMENT_SIZE`]).

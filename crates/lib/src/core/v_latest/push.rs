@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use crate::constants::DEFAULT_REMOTE_NAME;
-use crate::constants::stream_segment_size;
+use crate::constants::{push_small_batch_max_files, stream_segment_size};
 use crate::core::progress::push_progress::PushProgress;
 use crate::error::OxenError;
 use crate::model::merkle_tree::node::MerkleTreeNode;
@@ -751,14 +751,8 @@ async fn bundle_and_send_small_entries(
         return Ok(());
     }
 
-    // Compute size for this subset of entries
     let total_size = repositories::entries::compute_entries_size(&entries)?;
-    let num_chunks = ((total_size / avg_chunk_size) + 1) as usize;
-
-    let mut chunk_size = entries.len() / num_chunks;
-    if num_chunks > entries.len() {
-        chunk_size = entries.len();
-    }
+    let max_files_per_batch = push_small_batch_max_files();
 
     // Create a client for uploading chunks
     let client = Arc::new(api::client::new_for_remote_repo(remote_repo)?);
@@ -775,19 +769,23 @@ async fn bundle_and_send_small_entries(
     type TaskQueue = deadqueue::limited::Queue<PieceOfWork>;
     type FinishedTaskQueue = deadqueue::limited::Queue<bool>;
 
-    log::debug!("Creating {num_chunks} chunks from {total_size} bytes with size {chunk_size}");
-    let chunks: Vec<PieceOfWork> = entries
-        .chunks(chunk_size)
-        .map(|c| {
-            (
-                c.to_owned(),
-                local_repo.to_owned(),
-                commit.to_owned(),
-                remote_repo.to_owned(),
-                client.clone(),
-            )
-        })
-        .collect();
+    let chunks: Vec<PieceOfWork> =
+        small_entry_batches(&entries, avg_chunk_size, max_files_per_batch)
+            .into_iter()
+            .map(|c| {
+                (
+                    c,
+                    local_repo.to_owned(),
+                    commit.to_owned(),
+                    remote_repo.to_owned(),
+                    client.clone(),
+                )
+            })
+            .collect();
+    log::debug!(
+        "Creating {} small-entry upload batches from {total_size} bytes with max {avg_chunk_size} bytes and max {max_files_per_batch} files per request",
+        chunks.len()
+    );
 
     let worker_count = concurrency::num_threads_for_items(chunks.len());
     let queue = Arc::new(TaskQueue::new(chunks.len()));
@@ -873,6 +871,38 @@ async fn bundle_and_send_small_entries(
     Ok(())
 }
 
+fn small_entry_batches(
+    entries: &[CommitEntry],
+    max_bytes_per_batch: u64,
+    max_files_per_batch: usize,
+) -> Vec<Vec<CommitEntry>> {
+    let max_bytes_per_batch = max_bytes_per_batch.max(1);
+    let max_files_per_batch = max_files_per_batch.max(1);
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0_u64;
+
+    for entry in entries {
+        let would_exceed_files = current.len() >= max_files_per_batch;
+        let would_exceed_bytes = !current.is_empty()
+            && current_bytes.saturating_add(entry.num_bytes) > max_bytes_per_batch;
+
+        if would_exceed_files || would_exceed_bytes {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+
+        current_bytes = current_bytes.saturating_add(entry.num_bytes);
+        current.push(entry.clone());
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
+
 async fn find_latest_remote_commit(
     repo: &LocalRepository,
     remote_repo: &RemoteRepository,
@@ -916,10 +946,43 @@ mod tests {
     use crate::command;
     use crate::constants::{DEFAULT_BRANCH_NAME, DEFAULT_REMOTE_NAME};
     use crate::error::OxenError;
-    use crate::model::{Commit, LocalRepository};
+    use crate::model::{Commit, CommitEntry, LocalRepository};
     use crate::opts::PushOpts;
     use crate::repositories;
     use crate::test;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_small_entry_batches_respect_file_and_byte_limits() {
+        let entries = vec![
+            test_commit_entry("a.txt", 5),
+            test_commit_entry("b.txt", 5),
+            test_commit_entry("c.txt", 5),
+            test_commit_entry("d.txt", 20),
+            test_commit_entry("e.txt", 1),
+        ];
+
+        let batches = super::small_entry_batches(&entries, 10, 2);
+
+        assert_eq!(batches.len(), 4);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches[2].len(), 1);
+        assert_eq!(batches[3].len(), 1);
+        assert!(batches.iter().all(|batch| batch.len() <= 2));
+        assert_eq!(batches[2][0].path, PathBuf::from("d.txt"));
+    }
+
+    fn test_commit_entry(path: &str, num_bytes: u64) -> CommitEntry {
+        CommitEntry {
+            commit_id: "commit".to_string(),
+            path: PathBuf::from(path),
+            hash: format!("{num_bytes:032x}"),
+            num_bytes,
+            last_modified_seconds: 0,
+            last_modified_nanoseconds: 0,
+        }
+    }
 
     #[tokio::test]
     async fn test_new_branch_push_leaves_resumable_branch_after_later_commit_failure()
@@ -970,7 +1033,7 @@ mod tests {
         let entries = repositories::entries::list_for_commit(repo, commit)?;
         let entry = entries
             .iter()
-            .find(|entry| entry.path == std::path::PathBuf::from(path))
+            .find(|entry| entry.path == std::path::Path::new(path))
             .ok_or_else(|| OxenError::basic_str(format!("expected commit to contain {path}")))?;
         repo.version_store().delete_version(&entry.hash).await
     }
