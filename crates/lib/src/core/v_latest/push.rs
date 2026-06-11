@@ -603,7 +603,13 @@ pub async fn push_entries(
         progress,
     );
 
-    match tokio::join!(large_entries_sync, small_entries_sync) {
+    format_push_entries_error(tokio::join!(large_entries_sync, small_entries_sync))
+}
+
+fn format_push_entries_error(
+    result: (Result<(), OxenError>, Result<(), OxenError>),
+) -> Result<(), OxenError> {
+    match result {
         (Ok(_), Ok(_)) => {
             log::debug!("Moving on to post-push validation");
             Ok(())
@@ -616,7 +622,9 @@ pub async fn push_entries(
             let err = format!("Error syncing small entries: {err}");
             Err(OxenError::basic_str(err))
         }
-        _ => Err(OxenError::basic_str("Unknown error syncing entries")),
+        (Err(large_err), Err(small_err)) => Err(OxenError::basic_str(format!(
+            "Error syncing entries:\nLarge entries: {large_err}\nSmall entries: {small_err}"
+        ))),
     }
 }
 
@@ -951,6 +959,20 @@ mod tests {
     use crate::repositories;
     use crate::test;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_push_entries_reports_large_and_small_errors() {
+        let err = super::format_push_entries_error((
+            Err(OxenError::basic_str("large failed")),
+            Err(OxenError::basic_str("small failed")),
+        ))
+        .expect_err("both sides failed");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("Large entries: large failed"));
+        assert!(rendered.contains("Small entries: small failed"));
+        assert!(!rendered.contains("Unknown error syncing entries"));
+    }
 
     #[test]
     fn test_small_entry_batches_respect_file_and_byte_limits() {

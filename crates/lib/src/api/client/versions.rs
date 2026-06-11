@@ -367,19 +367,36 @@ async fn upload_chunks(
                     let mut i = 0;
                     if parallel_failures > 0 {
                         while let Err(ul_err) = chunk {
+                            let file_hash = upload.hash.to_string();
                             if i >= max_retries {
-                                return Err(OxenError::basic_str(format!(
-                                    "Failed after too many retries ({max_retries}): {ul_err}"
-                                )));
+                                return Err(OxenError::basic_str(
+                                    format_large_chunk_retry_exhausted(
+                                        &file_hash,
+                                        start,
+                                        chunk_size,
+                                        max_retries + 1,
+                                        &ul_err,
+                                    ),
+                                ));
                             }
 
                             let parallel_failure_permit = parallel_failures_semaphore.clone().try_acquire_owned().map_err(|err| {
                                 OxenError::basic_str(format!(
-                                    "Failed too many failures in parallel ({parallel_failures}): {ul_err} ({err})"
+                                    "Failed too many large-file chunk failures in parallel ({parallel_failures}) for hash {file_hash} offset {start}: {ul_err} ({err})"
                                 ))
                             })?;
 
                             let wait_time = exponential_backoff(BASE_WAIT_TIME, i, MAX_WAIT_TIME);
+                            log::warn!(
+                                "Large-file chunk upload failed for hash {} offset {} chunk_size {} attempt {}/{}: {}; retrying in {}ms",
+                                file_hash,
+                                start,
+                                chunk_size,
+                                i + 1,
+                                max_retries + 1,
+                                ul_err,
+                                wait_time
+                            );
                             sleep(Duration::from_millis(wait_time as u64)).await;
 
                             chunk = upload_chunk(&client, &remote_repo, &upload, start, chunk_size).await;
@@ -419,6 +436,18 @@ async fn upload_chunks(
         p.add_files(1);
     }
     Ok(results)
+}
+
+fn format_large_chunk_retry_exhausted(
+    file_hash: &str,
+    offset: u64,
+    chunk_size: u64,
+    attempts: usize,
+    err: &OxenError,
+) -> String {
+    format!(
+        "Failed large-file chunk upload after {attempts} attempts: hash={file_hash} offset={offset} chunk_size={chunk_size}: {err}"
+    )
 }
 
 async fn upload_chunk(
@@ -840,6 +869,19 @@ mod tests {
     use crate::api;
     use crate::error::OxenError;
     use crate::test;
+
+    #[test]
+    fn test_large_chunk_retry_exhausted_message_includes_chunk_context() {
+        let err = OxenError::basic_str("streaming error");
+        let message =
+            super::format_large_chunk_retry_exhausted("abc123", 524288, 10485760, 11, &err);
+
+        assert!(message.contains("after 11 attempts"));
+        assert!(message.contains("hash=abc123"));
+        assert!(message.contains("offset=524288"));
+        assert!(message.contains("chunk_size=10485760"));
+        assert!(message.contains("streaming error"));
+    }
 
     #[tokio::test]
     async fn test_upload_large_file_in_chunks() -> Result<(), OxenError> {
