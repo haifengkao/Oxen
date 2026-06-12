@@ -172,6 +172,14 @@ pub enum OxenError {
     #[error("{0}")]
     InvalidFileType(StringError),
 
+    /// The user supplied a CSV delimiter that was not exactly one byte.
+    #[error("Delimiter must be a single character")]
+    InvalidDelimiter,
+
+    /// The user supplied an empty CSV quote character.
+    #[error("If provided, the quote character must be non-empty")]
+    InvalidQuoteChar,
+
     //
     // Workspaces
     //
@@ -248,6 +256,10 @@ pub enum OxenError {
     /// The version is invalid or unsupported.
     #[error("Invalid version: {0}")]
     InvalidVersion(StringError),
+
+    /// The repository was created by an Oxen version this CLI no longer supports.
+    #[error("This repository was created by Oxen v{0}, which is no longer supported by this CLI.")]
+    UnsupportedRepoVersion(StringError),
 
     #[error("Unknown migration: {0}")]
     UnknownMigration(String),
@@ -409,6 +421,32 @@ pub enum OxenError {
         path: PathBuf,
         expected: MerkleHash,
         actual: MerkleHash,
+    },
+
+    /// Failed to open the refs RocksDB database at the given path.
+    #[error("Failed to open refs database {path:?}: {source}")]
+    RefsDbOpenFailed {
+        path: PathBuf,
+        #[source]
+        source: rocksdb::Error,
+    },
+
+    /// Tried to create or rename to a branch name that already exists.
+    #[error("Branch already exists: {0}")]
+    BranchAlreadyExists(String),
+
+    /// Branch name violates the ref-format rules (see git-check-ref-format).
+    #[error("'{0}' is not a valid branch name.")]
+    InvalidBranchName(String),
+
+    /// `compare_and_swap_branch_commit_id` saw a branch head that did not match the expected
+    /// previous value. `expected = None` means the caller expected the branch to be absent;
+    /// `actual = None` means the branch was absent at the time of the swap attempt.
+    #[error("Branch '{branch}' head mismatch: expected {expected:?}, found {actual:?}")]
+    BranchHeadMismatch {
+        branch: String,
+        expected: Option<String>,
+        actual: Option<String>,
     },
 
     /// Encountered when authentication fails. Contains the authentication error message.
@@ -610,11 +648,13 @@ pub enum OxenError {
     //
     // Fallback
     //
-    // TODO: remove all uses of `Basic` and replace with specific errors.
+    // Legacy generic string error. Prefer InternalError for internal errors that no caller acts on,
+    // or a structured variant when the error is inspected or can reach the public liboxen API.
     #[error("{0}")]
     Basic(StringError),
 
-    // TODO: remove all uses of `Basic` and replace with specific errors.
+    // String fallback for internal errors that are never inspected and never reach the public
+    // liboxen API.
     #[error("{0}")]
     InternalError(StringError),
 }
@@ -747,6 +787,9 @@ impl OxenError {
             }
             DownloadBatchExhausted { .. } | VersionsMissingOnServer { .. } => {
                 "If a content blob is missing on the server, run `oxen push --missing-files` from a clone with the full local history to repair it."
+            }
+            UnsupportedRepoVersion(_) => {
+                "Use an older Oxen release to migrate this repository up to the current format, then retry with this CLI."
             }
             S3BackendMissingServerOpts => {
                 "Set `[storage] s3_bucket = \"<your-bucket>\"` in the server's config TOML and restart oxen-server."

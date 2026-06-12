@@ -3,14 +3,13 @@ use polars::frame::DataFrame;
 use polars::prelude::NamedFrom;
 use polars::prelude::PlSmallStr;
 use polars::series::Series;
-use rocksdb::DB;
 use serde_json::Value;
 
 use crate::constants::DIFF_STATUS_COL;
-use crate::core::db;
 use crate::model::merkle_tree::node::EMerkleTreeNode;
 use crate::opts::DFOpts;
 
+use crate::core::db::data_frames::changes_db;
 use crate::core::db::data_frames::df_db::with_df_db_manager;
 use crate::core::db::data_frames::rows;
 use crate::core::df::tabular;
@@ -257,16 +256,15 @@ pub async fn prepare_modified_or_removed_row(
 
     // let scan_rows = 10000 as usize;
     let version_store = repo.version_store();
-    let committed_df_path = version_store
-        .get_version_path(&commit_merkle_tree.hash.to_string())
-        .await?;
-
-    log::debug!("prepare_modified_or_removed_row() committed_df_path: {committed_df_path:?}");
 
     // TODONOW should not be using all rows - just need to parse delim
-    let lazy_df =
-        tabular::read_df_with_extension(committed_df_path, file_node.extension(), &DFOpts::empty())
-            .await?;
+    let lazy_df = tabular::read_version_df(
+        &version_store,
+        &commit_merkle_tree.hash.to_string(),
+        file_node.extension(),
+        &DFOpts::empty(),
+    )
+    .await?;
 
     // Get the row by index
     let mut row = lazy_df.slice(row_idx_og, 1_usize);
@@ -289,10 +287,9 @@ pub async fn restore_row_in_db(
 ) -> Result<DataFrame, OxenError> {
     let row_id = row_id.as_ref();
     let db_path = repositories::workspaces::data_frames::duckdb_path(workspace, path.as_ref());
-    let opts = db::key_val::opts::default();
     let column_changes_path =
         repositories::workspaces::data_frames::column_changes_path(workspace, path.as_ref());
-    let db = DB::open(&opts, dunce::simplified(&column_changes_path))?;
+    let db = changes_db::get_changes_db(&column_changes_path)?;
 
     // Get the row by id
     let row =

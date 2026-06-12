@@ -3,14 +3,13 @@
 //! Create, read, and list commits
 //!
 
-use crate::core::versions::MinOxenVersion;
+use crate::core;
 use crate::error::OxenError;
 use crate::model::User;
-use crate::model::{Commit, LocalRepository, MerkleHash};
+use crate::model::{Commit, LocalRepository};
 use crate::opts::PaginateOpts;
 use crate::util;
 use crate::view::{PaginatedCommits, StatusMessage};
-use crate::{core, resource};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,10 +37,7 @@ pub mod commit_writer;
 /// repositories::commit(&repo, "My commit message")?;
 /// ```
 pub fn commit(repo: &LocalRepository, message: &str) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::commit(repo, message),
-    }
+    core::v_latest::commits::commit(repo, message)
 }
 
 pub fn commit_with_user(
@@ -49,10 +45,7 @@ pub fn commit_with_user(
     message: &str,
     user: &User,
 ) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::commit_with_user(repo, message, user),
-    }
+    core::v_latest::commits::commit_with_user(repo, message, user)
 }
 
 /// # Commit with --allow-empty flag
@@ -63,52 +56,24 @@ pub async fn commit_allow_empty(
     repo: &LocalRepository,
     message: &str,
 ) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::commit_allow_empty(repo, message).await,
-    }
+    core::v_latest::commits::commit_allow_empty(repo, message).await
 }
 
 /// Iterate over all commits and get the one with the latest timestamp
-pub fn latest_commit(repo: &LocalRepository) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::latest_commit(repo),
-    }
-}
+pub use crate::core::v_latest::commits::latest_commit;
 
 /// The current HEAD commit of the branch you currently have checked out
-pub fn head_commit(repo: &LocalRepository) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::head_commit(repo),
-    }
-}
+pub use crate::core::v_latest::commits::head_commit;
 
 /// Maybe get the head commit if it exists
 /// Returns None if the head commit does not exist (empty repo)
-pub fn head_commit_maybe(repo: &LocalRepository) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::head_commit_maybe(repo),
-    }
-}
+pub use crate::core::v_latest::commits::head_commit_maybe;
 
 /// Get the root commit of a repository
-pub fn root_commit_maybe(repo: &LocalRepository) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::root_commit_maybe(repo),
-    }
-}
+pub use crate::core::v_latest::commits::root_commit_maybe;
 
 /// Get a commit by it's MerkleHash
-pub fn get_by_hash(repo: &LocalRepository, hash: &MerkleHash) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::get_by_hash(repo, hash),
-    }
-}
+pub use crate::core::v_latest::commits::get_by_hash;
 
 /// Get a commit by it's string hash
 pub fn get_by_id(
@@ -116,10 +81,7 @@ pub fn get_by_id(
     commit_id: impl AsRef<str>,
 ) -> Result<Option<Commit>, OxenError> {
     let commit_id = commit_id.as_ref();
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::get_by_id(repo, commit_id),
-    }
+    core::v_latest::commits::get_by_id(repo, commit_id)
 }
 
 /// Commit id exists
@@ -137,10 +99,7 @@ pub fn create_empty_commit(
     commit: &Commit,
 ) -> Result<Commit, OxenError> {
     let branch_name = branch_name.as_ref();
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("create_empty_commit not supported in v0.10.0"),
-        _ => core::v_latest::commits::create_empty_commit(repo, branch_name, commit),
-    }
+    core::v_latest::commits::create_empty_commit(repo, branch_name, commit)
 }
 
 /// Create an initial empty commit for an empty repository.
@@ -154,38 +113,17 @@ pub fn create_initial_commit(
 ) -> Result<Commit, OxenError> {
     let branch_name = branch_name.as_ref();
     let message = message.as_ref();
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("create_initial_commit not supported in v0.10.0"),
-        _ => core::v_latest::commits::create_initial_commit(repo, branch_name, user, message),
-    }
+    core::v_latest::commits::create_initial_commit(repo, branch_name, user, message)
 }
 
 /// List commits on the current branch from HEAD
-pub fn list(repo: &LocalRepository) -> Result<Vec<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::list(repo),
-    }
-}
+pub use crate::core::v_latest::commits::list;
 
 /// List commits for the repository in no particular order
-pub fn list_all(repo: &LocalRepository) -> Result<HashSet<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::list_all(repo),
-    }
-}
+pub use crate::core::v_latest::commits::list_all;
 
 // Source
-pub fn get_commit_or_head<S: AsRef<str> + Clone>(
-    repo: &LocalRepository,
-    commit_id_or_branch_name: Option<S>,
-) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => resource::get_commit_or_head(repo, commit_id_or_branch_name),
-        _ => core::v_latest::commits::get_commit_or_head(repo, commit_id_or_branch_name),
-    }
-}
+pub use crate::core::v_latest::commits::get_commit_or_head;
 
 pub fn list_all_paginated(
     repo: &LocalRepository,
@@ -204,10 +142,7 @@ pub fn list_all_paginated(
 
 /// List the history for a specific branch or commit (revision)
 pub fn list_from(repo: &LocalRepository, revision: &str) -> Result<Vec<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::list_from(repo, revision),
-    }
+    core::v_latest::commits::list_from(repo, revision)
 }
 
 pub fn list_from_without_count_cache(
@@ -216,35 +151,18 @@ pub fn list_from_without_count_cache(
     skip: usize,
     limit: usize,
 ) -> Result<Vec<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::list_from_without_count_cache(repo, revision, skip, limit),
-    }
+    core::v_latest::commits::list_from_without_count_cache(repo, revision, skip, limit)
 }
 
 pub fn list_from_with_depth(
     repo: &LocalRepository,
     revision: &str,
 ) -> Result<HashMap<Commit, usize>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => Err(OxenError::basic_str(
-            "list_from_with_depth not supported in v0.10.0",
-        )),
-        _ => core::v_latest::commits::list_from_with_depth(repo, revision),
-    }
+    core::v_latest::commits::list_from_with_depth(repo, revision)
 }
 
 /// List the history between two commits
-pub fn list_between(
-    repo: &LocalRepository,
-    base: &Commit,
-    head: &Commit,
-) -> Result<Vec<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::list_between(repo, base, head),
-    }
-}
+pub use crate::core::v_latest::commits::list_between;
 
 /// Get a list of commits by the commit message
 pub fn get_by_message(
@@ -276,10 +194,7 @@ pub fn search_entries(
     commit: &Commit,
     pattern: &str,
 ) -> Result<HashSet<PathBuf>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::search_entries(repo, commit, pattern),
-    }
+    core::v_latest::commits::search_entries(repo, commit, pattern)
 }
 
 /// List paginated commits starting from the given revision
@@ -290,50 +205,45 @@ pub fn list_from_paginated(
 ) -> Result<PaginatedCommits, OxenError> {
     let _perf = crate::perf_guard!("commits::list_from_paginated");
 
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            // Calculate skip and limit based on pagination parameters
-            let skip = if pagination.page_num == 0 {
-                0
-            } else {
-                (pagination.page_num - 1) * pagination.page_size
-            };
-            let limit = pagination.page_size;
+    // Calculate skip and limit based on pagination parameters
+    let skip = if pagination.page_num == 0 {
+        0
+    } else {
+        (pagination.page_num - 1) * pagination.page_size
+    };
+    let limit = pagination.page_size;
 
-            let _perf_list = crate::perf_guard!("commits::list_from_paginated_optimized");
-            let (commits, total_entries, cached) =
-                core::v_latest::commits::list_from_paginated_impl(repo, revision, skip, limit)?;
-            log::info!(
-                "list_from_paginated {} got {} commits out of {} total (cached: {})",
-                revision,
-                commits.len(),
-                total_entries,
-                cached
-            );
-            drop(_perf_list);
+    let _perf_list = crate::perf_guard!("commits::list_from_paginated_optimized");
+    let (commits, total_entries, cached) =
+        core::v_latest::commits::list_from_paginated_impl(repo, revision, skip, limit)?;
+    log::info!(
+        "list_from_paginated {} got {} commits out of {} total (cached: {})",
+        revision,
+        commits.len(),
+        total_entries,
+        cached
+    );
+    drop(_perf_list);
 
-            // Calculate pagination metadata
-            let total_pages = if pagination.page_size > 0 {
-                (total_entries as f64 / pagination.page_size as f64).ceil() as usize
-            } else {
-                0
-            };
+    // Calculate pagination metadata
+    let total_pages = if pagination.page_size > 0 {
+        (total_entries as f64 / pagination.page_size as f64).ceil() as usize
+    } else {
+        0
+    };
 
-            let pagination = crate::view::Pagination {
-                page_size: pagination.page_size,
-                page_number: pagination.page_num,
-                total_pages,
-                total_entries,
-            };
+    let pagination = crate::view::Pagination {
+        page_size: pagination.page_size,
+        page_number: pagination.page_num,
+        total_pages,
+        total_entries,
+    };
 
-            Ok(PaginatedCommits {
-                status: StatusMessage::resource_found(),
-                commits,
-                pagination,
-            })
-        }
-    }
+    Ok(PaginatedCommits {
+        status: StatusMessage::resource_found(),
+        commits,
+        pagination,
+    })
 }
 
 /// List paginated commits by resource
@@ -346,21 +256,10 @@ pub fn list_by_path_from_paginated(
     let _perf = crate::perf_guard!("commits::list_by_path_from_paginated");
 
     log::info!("list_by_path_from_paginated: {commit:?} {path:?}");
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::commits::list_by_path_from_paginated(repo, commit, path, pagination),
-    }
+    core::v_latest::commits::list_by_path_from_paginated(repo, commit, path, pagination)
 }
 
-pub fn count_from(
-    repo: &LocalRepository,
-    revision: impl AsRef<str>,
-) -> Result<(usize, bool), OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => Err(OxenError::basic_str("count_from not supported in v0.10.0")),
-        _ => core::v_latest::commits::count_from(repo, revision),
-    }
-}
+pub use crate::core::v_latest::commits::count_from;
 
 #[cfg(test)]
 mod tests {
@@ -369,6 +268,7 @@ mod tests {
 
     use crate::error::OxenError;
     use crate::model::EntryDataType;
+    use crate::model::MerkleHash;
     use crate::model::StagedEntryStatus;
     use crate::opts::CloneOpts;
     use crate::opts::RmOpts;
@@ -533,9 +433,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_commit_removed_dir() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_no_commits_async(|repo| async move {
-            // (dir already created in helper)
-            let dir_to_remove = repo.path.join("train");
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let dir_to_remove =
+                test::populate_dir_with_txt_files(repo.path.join("train"), "file", 3)?;
             let og_file_count = util::fs::rcount_files_in_dir(&dir_to_remove);
 
             repositories::add(&repo, &dir_to_remove).await?;
@@ -739,20 +639,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_history_order() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_no_commits_async(|repo| async move {
-            let train_dir = repo.path.join("train");
-            repositories::add(&repo, train_dir).await?;
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let train_dir = test::populate_dir_with_txt_files(repo.path.join("train"), "train", 2)?;
+            repositories::add(&repo, &train_dir).await?;
             let initial_commit_message = "adding train dir";
             repositories::commit(&repo, initial_commit_message)?;
 
-            // Write a text file
             let text_path = repo.path.join("newnewnew.txt");
             util::fs::write_to_path(&text_path, "Hello World")?;
             repositories::add(&repo, &text_path).await?;
             repositories::commit(&repo, "adding text file")?;
 
-            let test_dir = repo.path.join("test");
-            repositories::add(&repo, test_dir).await?;
+            let test_dir = test::populate_dir_with_txt_files(repo.path.join("test"), "test", 2)?;
+            repositories::add(&repo, &test_dir).await?;
             let most_recent_message = "adding test dir";
             repositories::commit(&repo, most_recent_message)?;
 
@@ -769,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_commit_history_list_between() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_fully_committed_async(|repo| async move {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
             let new_file = repo.path.join("new_1.txt");
             test::write_txt_file_to_path(&new_file, "new 1")?;
             repositories::add(&repo, new_file).await?;
@@ -1064,7 +963,7 @@ A: Oxen.ai
     // The file size should be updated in the index
     #[tokio::test]
     async fn test_clone_subtree_commit_file_update_size() -> Result<(), OxenError> {
-        test::run_training_data_fully_sync_remote(|_local_repo, remote_repo| async move {
+        test::run_one_commit_sync_repo_test(|_local_repo, remote_repo| async move {
             let cloned_remote = remote_repo.clone();
             test::run_empty_dir_test_async(|dir| async move {
                 let mut opts = CloneOpts::new(&remote_repo.remote.url, dir.join("new_repo"));

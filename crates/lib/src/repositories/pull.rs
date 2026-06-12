@@ -4,10 +4,8 @@
 //!
 
 use crate::core;
-use crate::core::versions::MinOxenVersion;
 use crate::error::OxenError;
 use crate::model::LocalRepository;
-use crate::opts::fetch_opts::FetchOpts;
 
 /// Pull a repository's data from default branches origin/main
 /// Defaults defined in
@@ -19,10 +17,7 @@ pub async fn pull(repo: &LocalRepository) -> Result<(), OxenError> {
     #[cfg(feature = "metrics")]
     let timer = std::time::Instant::now();
 
-    let result = match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::pull::pull(repo).await,
-    };
+    let result = core::v_latest::pull::pull(repo).await;
 
     #[cfg(feature = "metrics")]
     {
@@ -37,23 +32,11 @@ pub async fn pull(repo: &LocalRepository) -> Result<(), OxenError> {
 pub async fn pull_all(repo: &LocalRepository) -> Result<(), OxenError> {
     #[cfg(feature = "metrics")]
     metrics::counter!("oxen_pull_total").increment(1);
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::pull::pull_all(repo).await,
-    }
+    core::v_latest::pull::pull_all(repo).await
 }
 
 /// Pull a specific remote and branch
-#[tracing::instrument(skip(repo, fetch_opts), fields(repo_path = %repo.path.display()))]
-pub async fn pull_remote_branch(
-    repo: &LocalRepository,
-    fetch_opts: &FetchOpts,
-) -> Result<(), OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::pull::pull_remote_branch(repo, fetch_opts).await,
-    }
-}
+pub use crate::core::v_latest::pull::pull_remote_branch;
 
 #[cfg(test)]
 mod tests {
@@ -78,13 +61,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_command_push_clone_pull_push() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_no_commits_async(|mut repo| async move {
-            // Track the file
+        test::run_empty_local_repo_test_async(|mut repo| async move {
+            // Track an inline data directory
             let train_dirname = "train";
             let train_dir = repo.path.join(train_dirname);
+            util::fs::create_dir_all(&train_dir)?;
+            for i in 0..3 {
+                test::write_txt_file_to_path(
+                    train_dir.join(format!("train_{i}.txt")),
+                    format!("train {i}"),
+                )?;
+            }
             let og_num_files = util::fs::rcount_files_in_dir(&train_dir);
             repositories::add(&repo, &train_dir).await?;
-            // Commit the train dir
             repositories::commit(&repo, "Adding training data")?;
 
             // Set the proper remote
@@ -690,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn test_push_pull_moved_files() -> Result<(), OxenError> {
         // Push the Remote Repo
-        test::run_training_data_fully_sync_remote(|local_repo, remote_repo| async move {
+        test::run_one_commit_sync_repo_test(|local_repo, remote_repo| async move {
             let remote_repo_copy = remote_repo.clone();
             let contents = "this is the file";
             let path = &local_repo.path.join("a.txt");
@@ -740,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_push_new_branch_default_clone() -> Result<(), OxenError> {
-        test::run_training_data_fully_sync_remote(|_local_repo, remote_repo| async move {
+        test::run_readme_remote_repo_test(|_, remote_repo| async move {
             let remote_repo_copy = remote_repo.clone();
             test::run_empty_dir_test_async(|repo_dir| async move {
                 // Clone the remote repo
@@ -975,7 +964,7 @@ mod tests {
     #[tokio::test]
     async fn test_flags_merge_conflict_on_pull() -> Result<(), OxenError> {
         // Push the Remote Repo
-        test::run_training_data_fully_sync_remote(|_, remote_repo| async move {
+        test::run_readme_remote_repo_test(|_, remote_repo| async move {
             let remote_repo_copy = remote_repo.clone();
 
             // Clone Repo to User A
@@ -1231,39 +1220,52 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_multiple_commits() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_no_commits_async(|mut repo| async move {
-            // Track a file
-            let filename = "labels.txt";
-            let file_path = repo.path.join(filename);
+        test::run_empty_local_repo_test_async(|mut repo| async move {
+            // First commit: a single inline file
+            let file_path = repo.path.join("labels.txt");
+            test::write_txt_file_to_path(&file_path, "label_a\nlabel_b")?;
             repositories::add(&repo, &file_path).await?;
             repositories::commit(&repo, "Adding labels file")?;
 
+            // Second commit: inline `train` dir with 2 files
             let train_path = repo.path.join("train");
+            util::fs::create_dir_all(&train_path)?;
+            for i in 0..2 {
+                test::write_txt_file_to_path(
+                    train_path.join(format!("train_{i}.txt")),
+                    format!("train {i}"),
+                )?;
+            }
             repositories::add(&repo, &train_path).await?;
             repositories::commit(&repo, "Adding train dir")?;
 
+            // Third commit: inline `test` dir with 2 files
             let test_path = repo.path.join("test");
+            util::fs::create_dir_all(&test_path)?;
+            for i in 0..2 {
+                test::write_txt_file_to_path(
+                    test_path.join(format!("test_{i}.txt")),
+                    format!("test {i}"),
+                )?;
+            }
             repositories::add(&repo, &test_path).await?;
             repositories::commit(&repo, "Adding test dir")?;
 
             // Set the proper remote
             let remote = test::repo_remote_url_from(&repo.dirname());
             command::config::set_remote(&mut repo, constants::DEFAULT_REMOTE_NAME, &remote)?;
-
-            // Create Remote
             let remote_repo = test::create_remote_repo(&repo).await?;
-
-            // Push it
             repositories::push(&repo).await?;
 
-            // run another test with a new repo dir that we are going to sync to
+            let expected_files = util::fs::rcount_files_in_dir(&repo.path);
+
+            // Clone elsewhere and confirm all the committed files come back
             test::run_empty_dir_test_async(|new_repo_dir| async move {
                 let new_repo_dir = new_repo_dir.join("repoo");
                 let cloned_repo =
                     repositories::clone_url(&remote_repo.remote.url, &new_repo_dir).await?;
                 let cloned_num_files = util::fs::rcount_files_in_dir(&cloned_repo.path);
-                // 4 test, 7 train, 1 labels
-                assert_eq!(12, cloned_num_files);
+                assert_eq!(expected_files, cloned_num_files);
 
                 api::client::repositories::delete(&remote_repo).await?;
 
@@ -1277,9 +1279,10 @@ mod tests {
     #[tokio::test]
     /// `oxen pull` should always walks the merkle tree and re-fetch any missing blobs.
     async fn test_pull_re_fetches_missing_blobs() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_no_commits_async(|mut repo| async move {
+        test::run_empty_local_repo_test_async(|mut repo| async move {
             // Two commits on the remote so the cloned repo has somewhere to lag back to.
             let labels = repo.path.join("labels.txt");
+            test::write_txt_file_to_path(&labels, "first commit content")?;
             repositories::add(&repo, &labels).await?;
             let first_commit = repositories::commit(&repo, "First commit")?;
 
@@ -1477,27 +1480,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_full_commit_history() -> Result<(), OxenError> {
-        test::run_training_data_repo_test_no_commits_async(|mut repo| async move {
+        test::run_empty_local_repo_test_async(|mut repo| async move {
             // First commit
-            let filename = "labels.txt";
-            let filepath = repo.path.join(filename);
+            let filepath = repo.path.join("labels.txt");
+            test::write_txt_file_to_path(&filepath, "label_a\nlabel_b")?;
             repositories::add(&repo, &filepath).await?;
             repositories::commit(&repo, "Adding labels file")?;
 
             // Second commit
-            let new_filename = "new.txt";
-            let new_filepath = repo.path.join(new_filename);
+            let new_filepath = repo.path.join("new.txt");
             util::fs::write_to_path(&new_filepath, "hallo")?;
             repositories::add(&repo, &new_filepath).await?;
             repositories::commit(&repo, "Adding a new file")?;
 
-            // Third commit
+            // Third commit: inline train dir
             let train_path = repo.path.join("train");
+            util::fs::create_dir_all(&train_path)?;
+            for i in 0..2 {
+                test::write_txt_file_to_path(
+                    train_path.join(format!("train_{i}.txt")),
+                    format!("train {i}"),
+                )?;
+            }
             repositories::add(&repo, &train_path).await?;
             repositories::commit(&repo, "Adding train dir")?;
 
-            // Fourth commit
+            // Fourth commit: inline test dir
             let test_path = repo.path.join("test");
+            util::fs::create_dir_all(&test_path)?;
+            for i in 0..2 {
+                test::write_txt_file_to_path(
+                    test_path.join(format!("test_{i}.txt")),
+                    format!("test {i}"),
+                )?;
+            }
             repositories::add(&repo, &test_path).await?;
             repositories::commit(&repo, "Adding test dir")?;
 

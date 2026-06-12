@@ -1,11 +1,8 @@
-use std::path::{Path, PathBuf};
-
 use crate::core;
-use crate::core::versions::MinOxenVersion;
 use crate::error::OxenError;
 use crate::model::Commit;
+use crate::model::LocalRepository;
 use crate::model::merge_conflict::MergeConflict;
-use crate::model::{Branch, LocalRepository};
 
 #[derive(Debug)]
 pub struct MergeCommits {
@@ -35,117 +32,30 @@ impl MergeCommits {
 }
 
 pub fn list_conflicts(repo: &LocalRepository) -> Result<Vec<MergeConflict>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            let conflicts = core::v_latest::merge::list_conflicts(repo)?;
-            Ok(conflicts
-                .iter()
-                .map(|conflict| conflict.to_merge_conflict())
-                .collect())
-        }
-    }
+    let conflicts = core::v_latest::merge::list_conflicts(repo)?;
+    Ok(conflicts
+        .iter()
+        .map(|conflict| conflict.to_merge_conflict())
+        .collect())
 }
 
-pub async fn has_conflicts(
-    repo: &LocalRepository,
-    base_branch: &Branch,
-    merge_branch: &Branch,
-) -> Result<bool, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::has_conflicts(repo, base_branch, merge_branch).await,
-    }
-}
+pub use crate::core::v_latest::merge::has_conflicts;
 
-pub fn mark_conflict_as_resolved(repo: &LocalRepository, path: &Path) -> Result<(), OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("mark_conflict_as_resolved not supported for oxen v0.10"),
-        _ => core::v_latest::merge::mark_conflict_as_resolved(repo, path),
-    }
-}
+pub use crate::core::v_latest::merge::mark_conflict_as_resolved;
 
-pub async fn can_merge_commits(
-    repo: &LocalRepository,
-    base_commit: &Commit,
-    merge_commit: &Commit,
-) -> Result<bool, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::can_merge_commits(repo, base_commit, merge_commit).await,
-    }
-}
+pub use crate::core::v_latest::merge::can_merge_commits;
 
-pub async fn list_conflicts_between_branches(
-    repo: &LocalRepository,
-    base_branch: &Branch,
-    merge_branch: &Branch,
-) -> Result<Vec<PathBuf>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            core::v_latest::merge::list_conflicts_between_branches(repo, base_branch, merge_branch)
-                .await
-        }
-    }
-}
+pub use crate::core::v_latest::merge::list_conflicts_between_branches;
 
-pub fn list_commits_between_branches(
-    repo: &LocalRepository,
-    base_branch: &Branch,
-    head_branch: &Branch,
-) -> Result<Vec<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::list_commits_between_branches(repo, base_branch, head_branch),
-    }
-}
+pub use crate::core::v_latest::merge::list_commits_between_branches;
 
-pub fn list_commits_between_commits(
-    repo: &LocalRepository,
-    base_commit: &Commit,
-    head_commit: &Commit,
-) -> Result<Vec<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::list_commits_between_commits(repo, base_commit, head_commit),
-    }
-}
+pub use crate::core::v_latest::merge::list_commits_between_commits;
 
-pub async fn list_conflicts_between_commits(
-    repo: &LocalRepository,
-    base_commit: &Commit,
-    merge_commit: &Commit,
-) -> Result<Vec<PathBuf>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            core::v_latest::merge::list_conflicts_between_commits(repo, base_commit, merge_commit)
-                .await
-        }
-    }
-}
+pub use crate::core::v_latest::merge::list_conflicts_between_commits;
 
-pub async fn merge_into_base(
-    repo: &LocalRepository,
-    merge_branch: &Branch,
-    base_branch: &Branch,
-) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::merge_into_base(repo, merge_branch, base_branch).await,
-    }
-}
+pub use crate::core::v_latest::merge::merge_into_base;
 
-pub async fn merge(
-    repo: &LocalRepository,
-    branch_name: impl AsRef<str>,
-) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::merge(repo, branch_name).await,
-    }
-}
+pub use crate::core::v_latest::merge::merge;
 
 /// Server-safe merge of two commits. Does not touch the working directory or
 /// HEAD — the caller is responsible for updating the branch ref.
@@ -153,106 +63,27 @@ pub async fn merge(
 /// Use this variant from server code paths that must not mutate on-disk files.
 /// For the client-side equivalent that updates the checkout and HEAD, see
 /// [`merge_commit_into_base`].
-pub async fn merge_commit_into_base_server_safe(
-    repo: &LocalRepository,
-    merge_commit: &Commit,
-    base_commit: &Commit,
-) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            core::v_latest::merge::merge_commit_into_base_server_safe(
-                repo,
-                merge_commit,
-                base_commit,
-            )
-            .await
-        }
-    }
-}
+pub use crate::core::v_latest::merge::merge_commit_into_base_server_safe;
 
 /// Client-side merge of two commits. Updates files on disk and advances HEAD.
 ///
 /// For the server-side equivalent that never touches the working directory,
 /// see [`merge_commit_into_base_server_safe`].
-pub async fn merge_commit_into_base(
-    repo: &LocalRepository,
-    merge_commit: &Commit,
-    base_commit: &Commit,
-) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::merge_commit_into_base(repo, merge_commit, base_commit).await,
-    }
-}
+pub use crate::core::v_latest::merge::merge_commit_into_base;
 
 /// Abandon an interrupted or in-conflict client-side merge. Clears `MERGE_IN_PROGRESS`,
 /// `MERGE_HEAD`, `ORIG_HEAD`, and the merge-conflicts DB, and restores the working tree to HEAD.
-pub async fn abort_merge(repo: &LocalRepository) -> Result<(), OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::abort_merge(repo).await,
-    }
-}
+pub use crate::core::v_latest::merge::abort_merge;
 
-pub async fn merge_commit_into_base_on_branch(
-    repo: &LocalRepository,
-    merge_commit: &Commit,
-    base_commit: &Commit,
-    branch: &Branch,
-) -> Result<Commit, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            core::v_latest::merge::merge_commit_into_base_on_branch(
-                repo,
-                merge_commit,
-                base_commit,
-                branch,
-            )
-            .await
-        }
-    }
-}
+pub use crate::core::v_latest::merge::merge_commit_into_base_on_branch;
 
-pub fn has_file(repo: &LocalRepository, path: &Path) -> Result<bool, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::has_file(repo, path),
-    }
-}
+pub use crate::core::v_latest::merge::has_file;
 
-pub fn remove_conflict_path(repo: &LocalRepository, path: &Path) -> Result<(), OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::remove_conflict_path(repo, path),
-    }
-}
+pub use crate::core::v_latest::merge::remove_conflict_path;
 
-pub fn find_merge_commits<S: AsRef<str>>(
-    repo: &LocalRepository,
-    branch_name: S,
-) -> Result<MergeCommits, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::find_merge_commits(repo, branch_name),
-    }
-}
+pub use crate::core::v_latest::merge::find_merge_commits;
 
-pub fn lowest_common_ancestor_from_commits(
-    repo: &LocalRepository,
-    base_commit: &Commit,
-    merge_commit: &Commit,
-) -> Result<Option<Commit>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::merge::lowest_common_ancestor_from_commits(
-            repo,
-            base_commit,
-            merge_commit,
-        ),
-    }
-}
+pub use crate::core::v_latest::merge::lowest_common_ancestor_from_commits;
 
 #[cfg(test)]
 mod tests {
@@ -414,73 +245,6 @@ mod tests {
         })
         .await
     }
-    #[tokio::test]
-    async fn test_merge_one_commit_modified_fast_forward() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            // Write and add hello file
-            let og_branch = repositories::branches::current_branch(&repo)?.unwrap();
-            let hello_file = repo.path.join("hello.txt");
-            util::fs::write_to_path(&hello_file, "Hello")?;
-            repositories::add(&repo, hello_file).await?;
-
-            // Write and add world file
-            let world_file = repo.path.join("world.txt");
-            let og_contents = "World";
-            util::fs::write_to_path(&world_file, og_contents)?;
-            repositories::add(&repo, &world_file).await?;
-
-            // Commit two files
-            repositories::commit(&repo, "Adding hello & world files")?;
-
-            // Branch to remove world
-            let branch_name = "modify-world";
-            repositories::branches::create_checkout(&repo, branch_name)?;
-
-            // Modify the file
-            let new_contents = "Around the world";
-            let world_file = test::modify_txt_file(world_file, new_contents)?;
-
-            // Commit the removal
-            repositories::add(&repo, &world_file).await?;
-            repositories::commit(&repo, "Modifying world file")?;
-
-            // Checkout and merge additions
-            repositories::checkout(&repo, &og_branch.name).await?;
-
-            // Make sure world file exists in it's original form
-            let contents = util::fs::read_from_path(&world_file)?;
-            assert_eq!(contents, og_contents);
-
-            repositories::merge::merge(&repo, branch_name)
-                .await?
-                .unwrap();
-
-            // Now that we've merged in, world file should be new content
-            assert!(world_file.exists(), "World file should exist after merge");
-            let contents = util::fs::read_from_path(&world_file)?;
-            assert_eq!(contents, new_contents);
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_merge_is_three_way_merge() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let merge_branch_name = "B"; // see populate function
-            populate_threeway_merge_repo(&repo, merge_branch_name).await?;
-
-            // Make sure the merger can detect the three way merge
-            let merge_commits = repositories::merge::find_merge_commits(&repo, merge_branch_name)?;
-            let is_fast_forward = merge_commits.is_fast_forward_merge();
-            assert!(!is_fast_forward);
-
-            Ok(())
-        })
-        .await
-    }
-
     #[tokio::test]
     async fn test_merge_get_lowest_common_ancestor() -> Result<(), OxenError> {
         test::run_one_commit_local_repo_test_async(|repo| async move {
@@ -1283,33 +1047,6 @@ mod tests {
         .await
     }
 
-    #[tokio::test]
-    async fn test_merge_immediately_after_checkout() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            // 1. Commit something in main branch
-            let og_branch = repositories::branches::current_branch(&repo)?.unwrap();
-            let labels_path = repo.path.join("labels.txt");
-            util::fs::write_to_path(&labels_path, "cat\ndog")?;
-            repositories::add(&repo, &labels_path).await?;
-            repositories::commit(&repo, "Add initial labels.txt file with cat and dog")?;
-
-            // 2. Create a new branch pointing at HEAD and check it out — equal tips with main.
-            let new_branch_name = "new_branch";
-            let new_branch = repositories::branches::create_checkout(&repo, new_branch_name)?;
-
-            // 3. Merging main into new_branch is a no-op (already up to date): returns the current
-            //    HEAD commit unchanged, with no new merge commit and no movement of HEAD.
-            let merged = repositories::merge::merge(&repo, og_branch.name).await?;
-            assert_eq!(merged.map(|c| c.id), Some(new_branch.commit_id.clone()));
-
-            let head_commit = repositories::commits::head_commit(&repo)?;
-            assert_eq!(head_commit.id, new_branch.commit_id);
-
-            Ok(())
-        })
-        .await
-    }
-
     // Regression test: files modified only on the merge branch whose parent directory
     // hash is shared between the LCA and base should not trigger "your local changes
     // would be overwritten."
@@ -1364,117 +1101,6 @@ mod tests {
     }
 
     // --- Client-side merge tests for delete edge cases ---
-
-    #[tokio::test]
-    async fn test_merge_client_base_deletes_merge_unchanged() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch_name = repositories::branches::current_branch(&repo)?.unwrap().name;
-
-            // LCA: create two files
-            let file_a = repo.path.join("a.txt");
-            let file_b = repo.path.join("b.txt");
-            util::fs::write_to_path(&file_a, "a")?;
-            util::fs::write_to_path(&file_b, "b")?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Adding a.txt and b.txt")?;
-
-            // Feature branch makes an unrelated change (doesn't touch a.txt)
-            repositories::branches::create_checkout(&repo, "feature")?;
-            util::fs::write_to_path(&file_b, "b modified on feature")?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Modifying b.txt on feature")?;
-
-            // Main branch deletes a.txt
-            repositories::checkout(&repo, &base_branch_name).await?;
-            util::fs::remove_file(&file_a)?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::commit(&repo, "Deleting a.txt on main")?;
-
-            // Merge feature into main — base's deletion of a.txt should be preserved
-            let merge_commit = repositories::merge::merge(&repo, "feature").await?;
-            assert!(merge_commit.is_some());
-
-            // a.txt should still be deleted in working dir (base's deletion wins)
-            assert!(
-                !file_a.exists(),
-                "a.txt should remain deleted after merge — base's deletion wins"
-            );
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_merge_client_modify_delete_conflict() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch_name = repositories::branches::current_branch(&repo)?.unwrap().name;
-
-            // LCA: create a file
-            let file = repo.path.join("shared.txt");
-            util::fs::write_to_path(&file, "original")?;
-            repositories::add(&repo, &file).await?;
-            repositories::commit(&repo, "Adding shared.txt")?;
-
-            // Feature branch modifies the file
-            repositories::branches::create_checkout(&repo, "feature")?;
-            util::fs::write_to_path(&file, "modified on feature")?;
-            repositories::add(&repo, &file).await?;
-            repositories::commit(&repo, "Modifying shared.txt on feature")?;
-
-            // Main branch deletes the same file
-            repositories::checkout(&repo, &base_branch_name).await?;
-            util::fs::remove_file(&file)?;
-            repositories::add(&repo, &file).await?;
-            repositories::commit(&repo, "Deleting shared.txt on main")?;
-
-            // Merge should detect conflict (delete on base + modify on merge)
-            let merge_result = repositories::merge::merge(&repo, "feature").await?;
-            assert!(
-                merge_result.is_none(),
-                "Delete on base + modify on merge should be a conflict"
-            );
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_merge_client_delete_modify_conflict() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch_name = repositories::branches::current_branch(&repo)?.unwrap().name;
-
-            // LCA: create a file
-            let file = repo.path.join("shared.txt");
-            util::fs::write_to_path(&file, "original")?;
-            repositories::add(&repo, &file).await?;
-            repositories::commit(&repo, "Adding shared.txt")?;
-
-            // Feature branch deletes the file
-            repositories::branches::create_checkout(&repo, "feature")?;
-            util::fs::remove_file(&file)?;
-            repositories::add(&repo, &file).await?;
-            repositories::commit(&repo, "Deleting shared.txt on feature")?;
-
-            // Main branch modifies the same file
-            repositories::checkout(&repo, &base_branch_name).await?;
-            util::fs::write_to_path(&file, "modified on main")?;
-            repositories::add(&repo, &file).await?;
-            repositories::commit(&repo, "Modifying shared.txt on main")?;
-
-            // Merge should detect conflict (modify on base + delete on merge)
-            let merge_result = repositories::merge::merge(&repo, "feature").await?;
-            assert!(
-                merge_result.is_none(),
-                "Modify on base + delete on merge should be a conflict"
-            );
-
-            Ok(())
-        })
-        .await
-    }
 
     // --- Server-side merge tests (merge_into_base) ---
 
@@ -1667,40 +1293,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_into_base_ff_with_modification() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch = repositories::branches::current_branch(&repo)?.unwrap();
-
-            let hello_file = repo.path.join("hello.txt");
-            util::fs::write_to_path(&hello_file, "Hello")?;
-            repositories::add(&repo, &hello_file).await?;
-            repositories::commit(&repo, "Adding hello file")?;
-
-            // Feature branch modifies the file
-            repositories::branches::create_checkout(&repo, "feature")?;
-            util::fs::write_to_path(&hello_file, "Hello, modified")?;
-            repositories::add(&repo, &hello_file).await?;
-            repositories::commit(&repo, "Modifying hello file")?;
-
-            repositories::checkout(&repo, &base_branch.name).await?;
-            let merge_branch = repositories::branches::get_by_name(&repo, "feature")?;
-            let base_branch = repositories::branches::get_by_name(&repo, &base_branch.name)?;
-
-            let merge_commit =
-                repositories::merge::merge_into_base(&repo, &merge_branch, &base_branch).await?;
-
-            assert_eq!(merge_commit.id, merge_branch.commit_id);
-
-            // Working dir should still have old content
-            let content = util::fs::read_from_path(&hello_file)?;
-            assert_eq!(content, "Hello");
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
     async fn test_merge_into_base_ff_with_deletion() -> Result<(), OxenError> {
         test::run_one_commit_local_repo_test_async(|repo| async move {
             let base_branch = repositories::branches::current_branch(&repo)?.unwrap();
@@ -1730,41 +1322,6 @@ mod tests {
 
             // Working dir should still have the file (server merge doesn't touch it)
             assert!(world_file.exists());
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_merge_into_base_ff_with_subdirectories() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch = repositories::branches::current_branch(&repo)?.unwrap();
-
-            let models_dir = repo.path.join("models").join("kling");
-            util::fs::create_dir_all(&models_dir)?;
-            let file_a = models_dir.join("a.toml");
-            util::fs::write_to_path(&file_a, "version = 1")?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::commit(&repo, "Adding models/kling/a.toml")?;
-
-            // Feature branch adds a file in a subdirectory
-            repositories::branches::create_checkout(&repo, "feature")?;
-            let file_b = models_dir.join("b.toml");
-            util::fs::write_to_path(&file_b, "version = 1")?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Adding models/kling/b.toml")?;
-
-            repositories::checkout(&repo, &base_branch.name).await?;
-            let merge_branch = repositories::branches::get_by_name(&repo, "feature")?;
-            let base_branch = repositories::branches::get_by_name(&repo, &base_branch.name)?;
-
-            let merge_commit =
-                repositories::merge::merge_into_base(&repo, &merge_branch, &base_branch).await?;
-
-            assert_eq!(merge_commit.id, merge_branch.commit_id);
-            let updated_branch = repositories::branches::get_by_name(&repo, &base_branch.name)?;
-            assert_eq!(updated_branch.commit_id, merge_commit.id);
 
             Ok(())
         })
@@ -1813,88 +1370,6 @@ mod tests {
                 !file_b.exists(),
                 "Server merge should not create models/b.toml on disk"
             );
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_merge_into_base_three_way_modification_no_conflict() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch_name = repositories::branches::current_branch(&repo)?.unwrap().name;
-
-            // Create two files
-            let file_a = repo.path.join("a.txt");
-            let file_b = repo.path.join("b.txt");
-            util::fs::write_to_path(&file_a, "a version 1")?;
-            util::fs::write_to_path(&file_b, "b version 1")?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Adding a.txt and b.txt")?;
-
-            // Feature branch modifies a.txt
-            repositories::branches::create_checkout(&repo, "feature")?;
-            util::fs::write_to_path(&file_a, "a version 2")?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::commit(&repo, "Modifying a.txt on feature")?;
-
-            // Main branch modifies b.txt (different file, no conflict)
-            repositories::checkout(&repo, &base_branch_name).await?;
-            util::fs::write_to_path(&file_b, "b version 2")?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Modifying b.txt on main")?;
-
-            let merge_branch = repositories::branches::get_by_name(&repo, "feature")?;
-            let base_branch = repositories::branches::get_by_name(&repo, &base_branch_name)?;
-
-            let merge_commit =
-                repositories::merge::merge_into_base(&repo, &merge_branch, &base_branch).await?;
-
-            assert_eq!(merge_commit.parent_ids.len(), 2);
-
-            // a.txt should still have the base version in working dir
-            let content = util::fs::read_from_path(&file_a)?;
-            assert_eq!(content, "a version 1");
-
-            Ok(())
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_merge_into_base_three_way_deletion_no_conflict() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let base_branch_name = repositories::branches::current_branch(&repo)?.unwrap().name;
-
-            // Create two files
-            let file_a = repo.path.join("a.txt");
-            let file_b = repo.path.join("b.txt");
-            util::fs::write_to_path(&file_a, "a")?;
-            util::fs::write_to_path(&file_b, "b")?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Adding a.txt and b.txt")?;
-
-            // Feature branch deletes a.txt
-            repositories::branches::create_checkout(&repo, "feature")?;
-            util::fs::remove_file(&file_a)?;
-            repositories::add(&repo, &file_a).await?;
-            repositories::commit(&repo, "Removing a.txt on feature")?;
-
-            // Main branch modifies b.txt (different file, no conflict)
-            repositories::checkout(&repo, &base_branch_name).await?;
-            util::fs::write_to_path(&file_b, "b modified")?;
-            repositories::add(&repo, &file_b).await?;
-            repositories::commit(&repo, "Modifying b.txt on main")?;
-
-            let merge_branch = repositories::branches::get_by_name(&repo, "feature")?;
-            let base_branch = repositories::branches::get_by_name(&repo, &base_branch_name)?;
-
-            let merge_commit =
-                repositories::merge::merge_into_base(&repo, &merge_branch, &base_branch).await?;
-
-            assert_eq!(merge_commit.parent_ids.len(), 2);
 
             Ok(())
         })
@@ -2602,35 +2077,6 @@ mod tests {
                 !merge_marker::exists(&repo).await?,
                 "marker must be cleared after an already-up-to-date merge"
             );
-            Ok(())
-        })
-        .await
-    }
-
-    // Abort restores the working tree from a fast-forward-in-progress state and
-    // clears every merge marker.
-    #[tokio::test]
-    async fn test_merge_abort_resets_partial_ff() -> Result<(), OxenError> {
-        test::run_one_commit_local_repo_test_async(|repo| async move {
-            let (_main, base, target) = make_feature_branch_with_modification(
-                &repo,
-                "world.txt",
-                "World",
-                "World2",
-                "update-world",
-            )
-            .await?;
-
-            let world_file = repo.path.join("world.txt");
-            util::fs::write_to_path(&world_file, "World2")?;
-            merge_marker::write(&repo, &target.id).await?;
-
-            repositories::merge::abort_merge(&repo).await?;
-
-            assert_eq!(util::fs::read_from_path(&world_file)?, "World");
-            assert!(!merge_marker::exists(&repo).await?);
-            let head = repositories::commits::head_commit(&repo)?;
-            assert_eq!(head.id, base.id, "HEAD must remain at the pre-merge base");
             Ok(())
         })
         .await

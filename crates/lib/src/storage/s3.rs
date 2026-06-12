@@ -22,7 +22,7 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::Stream;
 use tokio_util::io::StreamReader;
 
-use super::version_store::{LocalFilePath, VersionStore};
+use super::version_store::{LocalFilePath, VersionLocation, VersionStore};
 use crate::constants::{STREAMING_BUF_SIZE, VERSION_FILE_NAME};
 use crate::storage::version_encoding::{
     VERSION_METADATA_FILE_NAME, VersionEncodingMetadata, decode_from_storage, encode_for_storage,
@@ -59,11 +59,15 @@ pub struct S3VersionStore {
     client: OnceCell<Result<Arc<Client>, OxenError>>,
     bucket: String,
     prefix: String,
-    endpoint_url: Option<String>,
     region: Option<String>,
     force_path_style: bool,
     /// Threshold (bytes) below which we upload with a single PUT rather than a multipart upload.
     oneshot_size: u64,
+    /// Optional endpoint override (S3-compatible stores, the in-process s3s test fixture, MinIO,
+    /// etc.). `None` selects the default AWS endpoint. Surfaced through `VersionLocation::S3` so
+    /// cloud-aware readers (Polars `CloudOptions`, DuckDB `SET s3_endpoint=...`) hit the same
+    /// host as the version store itself.
+    endpoint_url: Option<String>,
 }
 
 impl S3VersionStore {
@@ -171,17 +175,22 @@ impl S3VersionStore {
     }
 
     #[cfg(test)]
-    pub fn new_with_client(client: Arc<Client>, bucket: String, prefix: String) -> Self {
+    pub fn new_with_client(
+        client: Arc<Client>,
+        bucket: String,
+        prefix: String,
+        endpoint_url: Option<String>,
+    ) -> Self {
         let cell = OnceCell::new();
         cell.set(Ok(client)).expect("cell was just created");
         Self {
             client: cell,
             bucket,
             prefix,
-            endpoint_url: None,
             region: None,
             force_path_style: false,
             oneshot_size: DEFAULT_ONESHOT_SIZE,
+            endpoint_url,
         }
     }
 
@@ -858,6 +867,20 @@ impl VersionStore for S3VersionStore {
         Ok(LocalFilePath::Temp(tmp))
     }
 
+    async fn version_location(&self, hash: &str) -> Result<VersionLocation, OxenError> {
+        let client = self.client().await?;
+        let region = client
+            .config()
+            .region()
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "us-east-1".to_string());
+        Ok(VersionLocation::S3 {
+            url: format!("s3://{}/{}", self.bucket, self.generate_key(hash)),
+            region,
+            endpoint_url: self.endpoint_url.clone(),
+        })
+    }
+
     /// Copy a version file to a destination path on the local filesystem, creating any necessary
     /// parent directories and overwriting any existing file at the destination path.
     // TODO: We should probably only allow writing to a specific set of path prefixes
@@ -877,10 +900,12 @@ impl VersionStore for S3VersionStore {
         tokio::io::copy_buf(&mut stream, &mut writer)
             .await
             .map_err(|e| OxenError::basic_str(format!("Failed to copy S3 stream to file: {e}")))?;
+        // `BufWriter::Drop` does not flush; flush explicitly so every byte reaches the file before
+        // a reader (e.g. DuckDB) opens the destination path.
         writer
             .flush()
             .await
-            .map_err(|e| OxenError::basic_str(format!("Failed to flush file: {e}")))?;
+            .map_err(|e| OxenError::basic_str(format!("Failed to flush S3 stream to file: {e}")))?;
 
         Ok(())
     }
@@ -1377,6 +1402,7 @@ mod tests {
             Arc::new(client),
             "test-bucket".to_string(),
             "test-namespace/test-repo".to_string(),
+            Some(format!("http://{addr}")),
         );
 
         (store, tmp, server_handle)
@@ -1458,6 +1484,33 @@ mod tests {
     fn assert_path_contains(path: impl AsRef<Path>, expected: &[u8]) {
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn test_version_location_returns_s3_variant_with_endpoint() {
+        let (store, _tmp, _server) = setup().await;
+        let hash = "abcdef1234567890";
+
+        let location = store.version_location(hash).await.unwrap();
+        match location {
+            VersionLocation::S3 {
+                url,
+                region,
+                endpoint_url,
+            } => {
+                assert_eq!(
+                    url,
+                    format!("s3://test-bucket/test-namespace/test-repo/{hash}/data")
+                );
+                assert_eq!(region, "us-east-1");
+                let endpoint = endpoint_url.expect("test setup configures a loopback endpoint");
+                assert!(
+                    endpoint.starts_with("http://127.0.0.1:"),
+                    "expected loopback endpoint url, got {endpoint:?}"
+                );
+            }
+            other => panic!("expected S3 variant, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2097,5 +2150,330 @@ mod tests {
         assert_eq!(store.endpoint_url(), Some("https://s3.example.com"));
         assert_eq!(store.region(), Some("us-test-1"));
         assert!(store.force_path_style());
+    }
+
+    /// Tabular reads served directly from S3 via `tabular::read_version_df`. Exercises the Polars
+    /// cloud-scan paths (Parquet/CSV/TSV/JSONL/IPC), the in-memory JSON path, and head-sample CSV
+    /// dialect sniffing — all against the s3s fixture.
+    mod cloud_reads {
+        use super::*;
+        use crate::core::df::tabular;
+        use crate::opts::DFOpts;
+        use polars::prelude::*;
+
+        /// Make the s3s fixture credentials discoverable by Polars' `from_env` cloud-scan path
+        /// (used for the columnar formats). All s3s tests share these fixed creds, and nothing else
+        /// in the test binary reads AWS credentials from the environment (the `S3VersionStore`
+        /// client is injected), so a one-time set is safe.
+        fn set_test_aws_env() {
+            use std::sync::Once;
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                // SAFETY: Set exactly once to constant values; no concurrent reader of these
+                // variables exists in the test binary, so there is no data race on the environment.
+                unsafe {
+                    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+                    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+                    std::env::set_var("AWS_REGION", "us-east-1");
+                }
+            });
+        }
+
+        /// Build an s3s-backed store as a trait object, the form `read_version_df` consumes.
+        async fn setup_dyn() -> (
+            Arc<dyn VersionStore>,
+            async_tempfile::TempDir,
+            tokio::task::JoinHandle<()>,
+        ) {
+            set_test_aws_env();
+            let (store, tmp, server) = setup().await;
+            (Arc::new(store), tmp, server)
+        }
+
+        /// Store `bytes` as a version file and return its hash so the reader can resolve it.
+        async fn upload(store: &Arc<dyn VersionStore>, bytes: Vec<u8>) -> String {
+            let hash = hasher::hash_buffer(&bytes);
+            let len = bytes.len() as u64;
+            store
+                .store_version_from_reader(&hash, Box::new(std::io::Cursor::new(bytes)), len)
+                .await
+                .unwrap();
+            hash
+        }
+
+        async fn read(store: &Arc<dyn VersionStore>, hash: &str, ext: &str) -> DataFrame {
+            tabular::read_version_df(store, hash, ext, &DFOpts::empty())
+                .await
+                .unwrap()
+        }
+
+        fn sample_df() -> DataFrame {
+            df! { "a" => &[1i64, 2, 3], "b" => &["x", "y", "z"] }.unwrap()
+        }
+
+        /// Assert a round-tripped frame matches `sample_df` by value, not just shape — catches
+        /// header-as-data, column swaps, and dtype/null coercion that a shape-only check misses.
+        fn assert_sample_df(df: &DataFrame) {
+            assert_eq!((df.height(), df.width()), (3, 2));
+            assert_eq!(df.column("a").unwrap().i64().unwrap().get(0), Some(1));
+            assert_eq!(df.column("b").unwrap().str().unwrap().get(2), Some("z"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_parquet() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload_sample_parquet(&store).await;
+
+            let df = read(&store, &hash, "parquet").await;
+            assert_sample_df(&df);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_ipc() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload_sample_ipc(&store).await;
+
+            let df = read(&store, &hash, "arrow").await;
+            assert_sample_df(&df);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_csv() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(&store, b"a,b\n1,x\n2,y\n3,z\n".to_vec()).await;
+
+            let df = read(&store, &hash, "csv").await;
+            assert_sample_df(&df);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_tsv() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(&store, b"a\tb\n1\tx\n2\ty\n3\tz\n".to_vec()).await;
+
+            let df = read(&store, &hash, "tsv").await;
+            assert_sample_df(&df);
+        }
+
+        /// A `.csv` file that is actually semicolon-delimited must still parse into two columns:
+        /// proves the head-sample dialect sniff runs against the S3 object, matching local behavior.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_csv_sniffs_non_default_delimiter() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(&store, b"a;b\n1;x\n2;y\n3;z\n".to_vec()).await;
+
+            // Value-level: a mis-sniff (defaulting to comma) would yield width 1, not the (3, 2)
+            // sample, so this asserts the semicolon was sniffed from the S3 head sample.
+            let df = read(&store, &hash, "csv").await;
+            assert_sample_df(&df);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_jsonl() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(
+                &store,
+                b"{\"a\":1,\"b\":\"x\"}\n{\"a\":2,\"b\":\"y\"}\n{\"a\":3,\"b\":\"z\"}\n".to_vec(),
+            )
+            .await;
+
+            let df = read(&store, &hash, "jsonl").await;
+            assert_sample_df(&df);
+        }
+
+        /// Non-line-delimited JSON has no Polars cloud reader, so this exercises the fetch-bytes
+        /// fallback path (`get` the whole object, then `JsonReader`).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_read_s3_json_array() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(
+                &store,
+                b"[{\"a\":1,\"b\":\"x\"},{\"a\":2,\"b\":\"y\"},{\"a\":3,\"b\":\"z\"}]".to_vec(),
+            )
+            .await;
+
+            let df = read(&store, &hash, "json").await;
+            assert_sample_df(&df);
+        }
+
+        // The following three tests use the default `#[tokio::test]` (current-thread) runtime to
+        // mirror the actix server. A transform that drives the cloud `LazyFrame` (collect or schema
+        // resolution) must run off the async worker via spawn_blocking, or Polars' `block_in_place`
+        // panics ("can call blocking only when running on the multi-threaded runtime").
+        async fn upload_sample_parquet(store: &Arc<dyn VersionStore>) -> String {
+            let mut buf = Vec::new();
+            ParquetWriter::new(&mut buf)
+                .finish(&mut sample_df())
+                .unwrap();
+            upload(store, buf).await
+        }
+
+        async fn upload_sample_ipc(store: &Arc<dyn VersionStore>) -> String {
+            let mut buf = Vec::new();
+            IpcWriter::new(&mut buf).finish(&mut sample_df()).unwrap();
+            upload(store, buf).await
+        }
+
+        #[tokio::test]
+        async fn test_read_s3_with_take_transform_current_thread() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload_sample_parquet(&store).await;
+            let mut opts = DFOpts::empty();
+            opts.take = Some("0,2".to_string());
+            let df = tabular::read_version_df(&store, &hash, "parquet", &opts)
+                .await
+                .unwrap();
+            assert_eq!((df.height(), df.width()), (2, 2));
+            let a = df.column("a").unwrap().i64().unwrap();
+            assert_eq!((a.get(0), a.get(1)), (Some(1), Some(3)));
+        }
+
+        #[tokio::test]
+        async fn test_read_s3_with_column_at_transform_current_thread() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload_sample_parquet(&store).await;
+            let mut opts = DFOpts::empty();
+            opts.item = Some("b:2".to_string());
+            let df = tabular::read_version_df(&store, &hash, "parquet", &opts)
+                .await
+                .unwrap();
+            assert_eq!(df.get(0).unwrap()[0], AnyValue::String("z"));
+        }
+
+        #[tokio::test]
+        async fn test_read_s3_with_filter_transform_current_thread() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload_sample_parquet(&store).await;
+            let mut opts = DFOpts::empty();
+            opts.filter = Some("a == 2".to_string());
+            let df = tabular::read_version_df(&store, &hash, "parquet", &opts)
+                .await
+                .unwrap();
+            assert_eq!((df.height(), df.width()), (1, 2));
+            assert_eq!(df.column("b").unwrap().str().unwrap().get(0), Some("y"));
+        }
+
+        // Non-parquet variant: the transform fix is format-agnostic, but the cloud-scan root differs
+        // per format, so exercise a filter (which resolves schema) over a JSONL cloud scan too.
+        #[tokio::test]
+        async fn test_read_s3_jsonl_with_filter_transform_current_thread() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(
+                &store,
+                b"{\"a\":1,\"b\":\"x\"}\n{\"a\":2,\"b\":\"y\"}\n{\"a\":3,\"b\":\"z\"}\n".to_vec(),
+            )
+            .await;
+            let mut opts = DFOpts::empty();
+            opts.filter = Some("a == 2".to_string());
+            let df = tabular::read_version_df(&store, &hash, "jsonl", &opts)
+                .await
+                .unwrap();
+            assert_eq!((df.height(), df.width()), (1, 2));
+            assert_eq!(df.column("b").unwrap().str().unwrap().get(0), Some("y"));
+        }
+
+        // A transform whose collect hits an S3 error (object never stored) must return a clean
+        // error, not panic via `unwrap` — and on the current-thread runtime it must not
+        // `block_in_place`-panic on the way there either.
+        #[tokio::test]
+        async fn test_read_s3_column_at_missing_object_errors_not_panics() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let mut opts = DFOpts::empty();
+            opts.item = Some("b:0".to_string());
+            let result =
+                tabular::read_version_df(&store, "deadbeefdeadbeef", "parquet", &opts).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_read_s3_arrow_with_sql_is_rejected() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload_sample_ipc(&store).await;
+            let mut opts = DFOpts::empty();
+            opts.sql = Some("SELECT * FROM df".to_string());
+            let result = tabular::read_version_df(&store, &hash, "arrow", &opts).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_read_s3_unknown_extension_errors() {
+            let (store, _tmp, _server) = setup_dyn().await;
+            let hash = upload(&store, b"not a data frame".to_vec()).await;
+            let result = tabular::read_version_df(&store, &hash, "xlsx", &DFOpts::empty()).await;
+            assert!(result.is_err());
+        }
+
+        /// End-to-end: index a workspace data frame whose version file lives in S3.
+        ///
+        /// Drives 16c's S3 branch of `workspaces::data_frames::index`: `version_location` returns
+        /// `S3`, so the bytes are streamed to a temp file via `copy_version_to_path` and DuckDB
+        /// reads that local path. The DuckDB database itself stays on local disk; only the version
+        /// file is sourced from the s3s fixture, exercising the path that has no local version
+        /// file to fall back on.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_index_workspace_data_frame_from_s3() -> Result<(), crate::error::OxenError> {
+            // DuckDB indexing is skipped on Windows across the workspace tests; mirror that.
+            if std::env::consts::OS == "windows" {
+                return Ok(());
+            }
+
+            use crate::config::UserConfig;
+            use crate::constants::TABLE_NAME;
+            use crate::core::db::data_frames::df_db;
+            use crate::core::db::data_frames::df_db::with_df_db_manager;
+            use crate::model::{LocalRepository, Workspace};
+            use crate::repositories;
+            use std::path::Path;
+
+            let (s3_store, _tmp, _server) = setup_dyn().await;
+
+            crate::test::run_training_data_repo_test_fully_committed_async(|repo| async move {
+                let file_path = Path::new("annotations")
+                    .join("train")
+                    .join("bounding_box.csv");
+                let commit = repositories::commits::head_commit(&repo)?;
+
+                // Mirror the committed file's version bytes into the S3 store under the same hash
+                // so the S3-backed index path has them to fetch.
+                let node =
+                    repositories::tree::get_node_by_path_with_children(&repo, &commit, &file_path)?
+                        .expect("committed file should resolve in the merkle tree");
+                let hash = node.hash.to_string();
+                let bytes = repo.version_store().get_version(&hash).await?;
+                s3_store.store_version(&hash, bytes.into()).await?;
+
+                // Build a workspace, then point its base repo at the S3-backed store.
+                let workspace_id = UserConfig::identifier()?;
+                let workspace =
+                    repositories::workspaces::create(&repo, &commit, workspace_id, true)?;
+                let s3_base = LocalRepository::new_for_testing(&workspace.base_repo, s3_store);
+                let s3_workspace = Workspace {
+                    base_repo: s3_base,
+                    ..workspace
+                };
+
+                // version_location -> S3 -> copy_version_to_path(temp) -> DuckDB read of the temp.
+                repositories::workspaces::data_frames::index(
+                    &s3_workspace.base_repo,
+                    &s3_workspace,
+                    &file_path,
+                )
+                .await?;
+
+                // The indexed table should be populated from the S3-sourced bytes.
+                let db_path =
+                    repositories::workspaces::data_frames::duckdb_path(&s3_workspace, &file_path);
+                let count = with_df_db_manager(&db_path, |manager| {
+                    manager.with_conn(|conn| {
+                        let n = df_db::count(conn, TABLE_NAME)?;
+                        Ok(n)
+                    })
+                })?;
+                assert!(count > 0, "expected the S3-indexed table to have rows");
+
+                Ok(())
+            })
+            .await
+        }
     }
 }

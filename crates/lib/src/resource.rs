@@ -1,7 +1,5 @@
 use crate::core::refs::with_ref_reader;
 
-use crate::core;
-use crate::core::versions::MinOxenVersion;
 use crate::error::OxenError;
 use crate::model::{Commit, LocalRepository, ParsedResource};
 use crate::repositories;
@@ -12,10 +10,7 @@ pub fn parse_resource_from_path(
     repo: &LocalRepository,
     path: &Path,
 ) -> Result<Option<ParsedResource>, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => core::v_latest::resource::parse_resource_from_path(repo, path),
-    }
+    crate::core::v_latest::resource::parse_resource_from_path(repo, path)
 }
 
 /// Pass in a branch name and maybe get a commit id back

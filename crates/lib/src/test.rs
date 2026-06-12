@@ -467,7 +467,7 @@ where
 
     let local_repo_dir = local_repo.path.clone();
 
-    for i in 1..26 {
+    for i in 1..6 {
         // Get random string
         let txt = generate_random_string(20);
         let file_path = add_txt_file_to_dir(&local_repo_dir, &txt)?;
@@ -1350,6 +1350,7 @@ pub fn maybe_cleanup_repo(repo_dir: &Path) -> Result<(), OxenError> {
     core::staged::remove_from_cache_with_children(repo_dir)?;
     core::refs::ref_manager::remove_from_cache_with_children(repo_dir)?;
     core::db::data_frames::df_db::remove_df_db_from_cache_with_children(repo_dir)?;
+    core::db::data_frames::changes_db::remove_from_cache_with_children(repo_dir)?;
     core::db::dir_hashes::dir_hashes_db::remove_from_cache_with_children(repo_dir)?;
     core::workspaces::workspace_name_index::remove_from_cache_with_children(repo_dir);
 
@@ -1935,6 +1936,24 @@ pub fn write_txt_file_to_path(
     let mut file = File::create(path)?;
     file.write_all(contents.as_bytes())?;
     Ok(path.to_path_buf())
+}
+
+/// Create `dir` and populate it with `count` files named `{prefix}_{i}.txt`,
+/// each containing the text `{prefix} {i}`. Returns the directory path.
+pub fn populate_dir_with_txt_files(
+    dir: impl AsRef<Path>,
+    prefix: &str,
+    count: usize,
+) -> Result<PathBuf, OxenError> {
+    let dir = dir.as_ref();
+    util::fs::create_dir_all(dir)?;
+    for i in 0..count {
+        write_txt_file_to_path(
+            dir.join(format!("{prefix}_{i}.txt")),
+            format!("{prefix} {i}"),
+        )?;
+    }
+    Ok(dir.to_path_buf())
 }
 
 pub fn append_line_txt_file<P: AsRef<Path>>(path: P, line: &str) -> Result<PathBuf, OxenError> {

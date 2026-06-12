@@ -81,6 +81,7 @@ use clap::{Parser, Subcommand};
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::config::storage_policy::StoragePolicyError;
@@ -142,7 +143,6 @@ const START_SERVER_USAGE: &str = "Usage: `oxen-server start -i 0.0.0.0 -p 3000`"
         crate::controllers::workspaces::changes::unstage_many,
         // Workspaces - files
         crate::controllers::workspaces::files::get,
-        crate::controllers::workspaces::files::add,
         crate::controllers::workspaces::files::add_version_files,
         crate::controllers::workspaces::files::rm_files,
         // Branches
@@ -361,6 +361,16 @@ enum ServerCommand {
             value_parser = clap::value_parser!(MerkleStoreKind),
         )]
         merkle_store_kind: MerkleStoreKind,
+
+        /// Run the server in test mode. Not for production use.
+        #[arg(
+            short = 't',
+            long = "test",
+            help = "Run the server in test mode. Currently this only relaxes the import SSRF \
+                    guard to allow loopback download targets so tests can serve fixtures from a \
+                    local mock HTTP server. Do not use in production."
+        )]
+        test: bool,
     },
 
     /// Create a new user in the server and output the config file for that user
@@ -475,6 +485,7 @@ async fn server() -> Result<(), ServerError> {
             auth,
             config,
             merkle_store_kind,
+            test,
         } => {
             let _metrics_guard = init_metrics()?;
             let server_config = load_server_config(config.as_deref())?;
@@ -491,6 +502,7 @@ async fn server() -> Result<(), ServerError> {
                     disable_merkle_cache: env::var("OXEN_DISABLE_MERKLE_CACHE").is_ok(),
                     enable_auth: auth,
                     merkle_store_kind,
+                    test_mode: test,
                 },
                 &sync_dir,
                 server_config,
@@ -576,6 +588,9 @@ struct ServerOpts {
     disable_merkle_cache: bool,
     enable_auth: bool,
     merkle_store_kind: MerkleStoreKind,
+    /// Test mode (`--test`): relaxes the import SSRF guard to allow loopback targets. Never
+    /// enabled in production.
+    test_mode: bool,
 }
 
 async fn start(
@@ -589,6 +604,7 @@ async fn start(
         disable_merkle_cache,
         enable_auth,
         merkle_store_kind,
+        test_mode,
     } = opts;
 
     // Configure merkle tree node caching
@@ -607,6 +623,7 @@ async fn start(
         path: PathBuf::from(sync_dir),
         config,
         merkle_store_kind,
+        test_mode,
     };
 
     {
@@ -621,6 +638,12 @@ async fn start(
     // `.run().await` returns, there is still time to perform other cleanup
     // operations before a supervisor force-kills the process.
     const ACTIX_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
+    // actix's default HTTP/1 keep-alive is 5s. Keep it comfortably above the OxenHub
+    // Finch client's idle-eviction window so the client always retires an idle pooled
+    // connection before the server reaps it — a reused server-closed socket surfaces
+    // to the client as a dropped connection (502 Bad Gateway).
+    const ACTIX_KEEP_ALIVE_SECS: u64 = 75;
 
     let server_result = HttpServer::new(move || {
         App::new()
@@ -664,6 +687,7 @@ async fn start(
             .wrap(MetricsMiddleware)
             .wrap(TracingLogger::default())
     })
+    .keep_alive(Duration::from_secs(ACTIX_KEEP_ALIVE_SECS))
     .bind((host.to_owned(), port))?
     .shutdown_timeout(ACTIX_SHUTDOWN_TIMEOUT_SECS)
     .run()

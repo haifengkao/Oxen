@@ -1,14 +1,12 @@
 //! Revisions can either be commits by id or head commits on branches by name
 
-use std::path::Path;
-
 use crate::core;
-use crate::core::versions::MinOxenVersion;
 use crate::error::OxenError;
 use crate::model::{Commit, LocalRepository};
 use crate::repositories;
 use crate::storage::LocalFilePath;
 use bytes::Bytes;
+use std::path::Path;
 use tokio_stream::Stream;
 
 /// Get a commit object from a commit id or branch name
@@ -32,12 +30,7 @@ pub async fn get_version_file_from_commit_id(
     commit_id: impl AsRef<str>,
     path: impl AsRef<Path>,
 ) -> Result<LocalFilePath, OxenError> {
-    match repo.min_version() {
-        MinOxenVersion::V0_10_0 => panic!("v0.10.0 no longer supported"),
-        _ => {
-            core::v_latest::revisions::get_version_file_from_commit_id(repo, commit_id, path).await
-        }
-    }
+    core::v_latest::revisions::get_version_file_from_commit_id(repo, commit_id, path).await
 }
 
 pub async fn get_version_stream_from_revision(

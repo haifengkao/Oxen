@@ -51,27 +51,21 @@ cargo build --workspace                           # Debug build
 ```
 
 ### Testing
-Many tests require the oxen server to be running. If it is not running on port 3000 and
-a test fails because it cannot connect to oxen-server, then start it:
+Use the `bin/test-rust` script to run the tests — do not invoke `cargo test` or `cargo nextest run` directly. The script builds the workspace, raises the file-handle limit, sets up a ramdisk for test data, starts `oxen-server` on a free port, runs the suite with `cargo nextest run`, and tears everything down on exit. Its full usage is documented in a comment at the top of the script.
 ```bash
-cargo run -p oxen-server start
+bin/test-rust                         # Build and run all Rust tests
+bin/test-rust test_function_name      # Run only Rust tests matching test_function_name
+bin/test-rust -p                      # Run the Python test suite (via pytest + maturin)
+bin/test-rust -p -k test_init         # Run Python tests matching test_init
 ```
-
-Run specific tests:
-```bash
-cargo test test_function_name         # Run specific matching tests
-cargo test --lib test_function_name   # Run specific library test
-```
-
-Run all tests
-```bash
-ulimit -n 10240                       # Increase file handles before running tests
-cargo nextest run                     # Run all tests
-```
+- The script starts `oxen-server` itself, so you do not need to start it separately.
+- It does not install prerequisites by default. If a dependency is missing, run `bin/install-prereqs` (or re-run with `bin/test-rust --install-deps`).
+- If the ramdisk cannot be mounted, pass `--no-ramdisk` to run against the regular filesystem.
+- Arguments after the script's own flags are forwarded to `cargo nextest run` (or `pytest` with `-p`).
 
 ### Testing with Debug Output
 ```bash
-env RUST_LOG=warn,liboxen=debug,integration_test=debug cargo test -- --nocapture test_name
+env RUST_LOG=warn,liboxen=debug,integration_test=debug bin/test-rust --no-capture test_name
 ```
 
 ### Code Quality
@@ -110,21 +104,21 @@ oxen push origin main               # Push to remote
 
 ## Code Organization
 - We define module exports in a `<module_name>.rs` file at the same level as the corresponding `module_name/` directory and *NOT* the older `mod.rs` pattern.
+- Prefer importing bare items (structs, enums, traits, functions, constants, macros) and referring to them unqualified, rather than importing a parent module and qualifying at each use site — e.g. `use std::time::Duration;` then `Duration::from_secs(5)`, not `std::time::Duration::from_secs(5)`. Exception: keep enough of the path to disambiguate when a bare import would be ambiguous or misleading, such as two same-named items from different modules, or where a module qualifier is the established idiom (the classic case is `use std::fmt;` then `fmt::Result` to avoid clashing with the prelude `Result`); reach for an `as` alias when that reads better than a module qualifier.
 
 ## Error Handling
 - Use the result type (`Result<T, Error>`) when an operation could fail.
 - Never use `.unwrap()` or `.expect()` on a `Result` or on an `Option`.
   + Exception: In test-only code, it is ok to use use `.expect(<descriptive explanation of invariant that was violated>)` since we want to fail fast and have good stack traces for failing test cases.
-  + This rule still applies when the panic feels "guaranteed unreachable" because of an upstream invariant. If the enclosing function returns a `Result`, surface the case as a structured `OxenError` variant and propagate with `?` — a panic in production code is never preferable to a clean error path, no matter how confident you are the case can't happen.
-- Use as specific of an error type as possible for a function. Don't use a wider type unless it's necessary. When making modules and related pieces of code, try to use a locally-defined error enum for them if they all have similar errors.
-- Make sure there's an `OxenError` variant for every error type. Be liberal in wrapping other modules error types, or other specific error types, in a new variant. Use a `Box<>` wrapper for it and have a `#[from]` to derive.
-- `OxenError` is the top-level type for everything. If you need to unify different error types into one, use `OxenError`. These kinds of functions should return `Result<T, OxenError>`
+  + This rule still applies when the panic feels "guaranteed unreachable" because of an upstream invariant. If the enclosing function returns a `Result`, propagate it with `?` — a panic in production code is never preferable to a clean error path, no matter how confident you are the case can't happen.
+- If an error type is acted upon in code, then use as specific of an error type as possible. Don't use a wider type unless it's necessary. When making modules and related pieces of code, try to use a locally-defined error enum for them if they all have similar errors.
+- liboxen uses `OxenError` as the top-level type for errors. Unify different error types under `OxenError`. Fallible functions should return `Result<T, OxenError>`. Do not create or use additional error types outside of `OxenError` if it can be avoided. If an error is never inspected internally and cannot be returned to a caller of the liboxen library through a public API, then use `OxenError::InternalError` with a formatted string. If an error is inspected or can be returned to a caller of the liboxen library through a public API, make a structured error variant on the `OxenError` `enum`.
+- oxen-server uses `OxenHttpError` as the top-level type for errors. All `OxenError` variants that we want to differentiate to the caller of the oxen-server API should be mapped to specific `OxenHttpError` variants. Otherwise they should be mapped to `OxenHttpError::InternalServerError`. Do not create or use additional error types outside of `OxenHttpError` if it can be avoided.
 - Implement proper error propagation through the `?` operator.
-- Never write code that uses `OxenError::Basic` or `OxenError::InternalError`. Do not use their constructor methods either (`OxenError::basic_str` and `OxenError::internal_error`, respectively). These variants are deprecated and will be removed. As a general principle, never encode an error as a string: it throws away valuable structured information about the error, which makes it impossible for a caller to handle the error programmatically. Instead, make a structured error variant of an appropriate error `enum` that describes the error. Include a `#[error("...")]` on the variant to provide a helpful user-facing error message describing the problem and, if applicable, a possible command or procedure the user can perform to fix the error.
-- If making logically related code that all share the same kind of errors, then strongly consider making a unique error `enum` _for that code only_. If that code is called by other code that has a different error enum, then define an explicit `impl From<SourceError> for TargetError` conversion to convert. If that makes the code messy, then make a conversion into `OxenError` and upgrade the calling function to return `OxenError` instead.
 
 # Making Changes
 
+- This repository is **public**. Do not mention Oxen's private/internal repositories — by name or description — in code comments, doc-comments, error messages, commit messages, PR titles or descriptions, or any other code or documentation committed here. Keep references to private repos out of public artifacts entirely; if internal context is genuinely needed, point to the relevant Linear issue rather than inlining private-repo details.
 - When changing something that is documented in nearby code, or appears in any markdown files in the repository, update the affected documentation.
 - When prompted to always do something a certain way in general, add an entry to this section of the CLAUDE.md file.
 - When calling `get_staged_db_manager`, follow the doc comment on that function: drop the returned `StagedDBManager` as soon as possible (via a block scope or explicit `drop()`) to avoid holding the shared database handle longer than necessary.
@@ -134,13 +128,14 @@ oxen push origin main               # Push to remote
 - The `bin/test-rust` script does not install prerequisites by default. If any dependencies turn out to be missing, prompt the user to run `bin/install-prereqs` (or re-run `bin/test-rust --install-deps`).
 - Prefer using inline code over creating a new function when the function would only be called once and the function body would be less than 15 lines.
 - Do not use "out parameters" (functions that take an `&mut Vec` / `&mut HashMap` / etc. for the callee to fill). Return the value directly instead. Exceptions: the user explicitly asks for an out parameter, or the caller genuinely needs to reuse a pre-allocated buffer across many calls to avoid allocation churn in a measured hot path.
-- Preserve comments whenever possible. Comments that were written by someone other than Claude should always be preserved or updated if possible.
+- Preserve code comments whenever possible. Comments that were written by someone other than Claude should always be preserved or updated if possible.
 - The Python project calls into the Rust project. Whenever changing the Rust code, check to see if the Python code needs to be updated.
 - After changing any Rust or Python code, verify that Rust tests pass with `bin/test-rust` and Python tests pass with `bin/test-rust -p`
 - When updating a dependency, prefer updating to the latest stable version.
 - Code that touches IO follows the **sync-core / async-edge** policy in [docs/async_policy.md](../docs/async_policy.md). Summary: public APIs are `async fn`; network IO (AWS SDK, reqwest, etc.) uses native async APIs; filesystem and sync-DB IO (`std::fs`, RocksDB, LMDB, DuckDB) runs inside `tokio::task::spawn_blocking` at *operation* granularity, not per syscall; DB transactions live entirely inside one `spawn_blocking` closure (never spanning `.await`); CPU-parallel batch work uses `rayon` inside one `spawn_blocking`, not `FuturesUnordered<spawn_blocking>`; streaming sync↔network IO uses a long-lived `spawn_blocking` task paired with the async side via `tokio::sync::mpsc`. Do **not** reach for `tokio::fs` in hot loops — it dispatches each syscall through the blocking pool and pays per-call overhead. See the doc for the full patterns (Bracket, Sandwich, Channel hand-off) and anti-patterns.
 - Streamed IO (anything reading or writing through an `AsyncRead`/`AsyncWrite` whose total length isn't bounded ahead of time) must use a large buffer rather than rely on `tokio::io::copy`'s 8 KB default. Wrap the write side in `tokio::io::BufWriter::with_capacity(10 * 1024 * 1024, ...)` (and the read side in `BufReader` if the source isn't already buffered), and remember to explicitly `flush().await?` the `BufWriter` before any downstream `sync_all`/rename/checksum step — `BufWriter`'s `Drop` does **not** auto-flush, so unflushed bytes are silently dropped. The canonical example is the S3 store's local-cache path in `crates/lib/src/storage/s3.rs` (`store_version_to_path`). See [docs/async_policy.md](../docs/async_policy.md) for the broader async/sync context this fits into.
 - Prefer `bytes::Bytes` over `&[u8]` and `Vec<u8>` for byte payloads that cross a module, trait, `spawn_blocking`, or external-SDK boundary. `Bytes` is `'static + Clone + Send` and refcounted: `Bytes::from(Vec<u8>)` reuses the allocation (zero copy), `Bytes::from_static(b"...")` is compile-time (zero cost), and cloning a `Bytes` is a refcount bump rather than a memcpy. Most async IO ecosystems we touch (`axum` request bodies, `reqwest::Response::bytes_stream`, `aws_sdk_s3::primitives::ByteStream`) speak `Bytes` natively — handing them a `Vec<u8>` costs an allocation and handing them a `&[u8]` costs an allocation **and** a memcpy. The canonical example is `VersionStore::store_version` in `crates/lib/src/storage/version_store.rs`: the trait signature went from `data: &[u8]` to `data: Bytes` so the in-memory writers can move bytes across the `spawn_blocking` boundary as a refcount transfer and the S3 impl can pass through to `ByteStream::from` without a `.to_vec()` copy. `&[u8]` is still the right type for transient borrows that don't cross a boundary (hashing once and discarding, inline inspection); use `BytesMut` for growable buffers and `freeze()` into `Bytes` when handing them off (e.g. the `read_buf` + `split().freeze()` pattern in `atomic_write_from_async_reader`).
+- When computing the number of fixed-size chunks needed to cover a total byte count, use `total_size.div_ceil(chunk_size)`, not `(total_size / chunk_size) + 1`. The `+1` form overshoots by one when `total_size` is an exact multiple of `chunk_size`, producing a spurious zero-byte chunk request that the server rejects with HTTP 500 "beyond end of file" — see the bug fixed in `download_large_entry` for what this looks like in production.
 - oxen-server operations should never touch a local checkout on disk when doing operations initiated by its API.
 - Always use `metadata.is_dir()` instead of `path.is_dir()`. `path.is_dir()` follows symlinks, which Oxen does not track — using it risks descending into directories outside the working tree (or into cycles via cyclic links).
 - Oxen does not track symlinks. New code that traverses the working tree should check `metadata.is_symlink()` and skip rather than resolve, follow, or record symlinks.
@@ -149,7 +144,10 @@ oxen push origin main               # Push to remote
 
 # Testing Rules
 - Use the test helpers in `crates/lib/src/test.rs` (e.g., `run_empty_local_repo_test`) for unit tests in the lib code.
-- Try to use the minimal helper for the scenario you are testing. E.g., don't use `run_training_data_fully_sync_remote` when `run_one_commit_local_repo_test` is enough.
+- When picking a helper from `crates/lib/src/test.rs`, choose the lightest one that meets your test's actual needs. Rough cost order, cheapest first: `run_empty_dir_test_async` → `run_empty_local_repo_test_async` → `run_one_commit_local_repo_test_async` → `run_readme_remote_repo_test` (remote with a single README pushed) → `run_one_commit_sync_repo_test` (local + remote, one inline commit) → `run_training_data_repo_test_no_commits_async` (training files written, not committed) → `run_training_data_repo_test_fully_committed_async` (training files + 6 commits, no remote) → `run_training_data_fully_sync_remote` (training files + 6 commits + remote + push; ~1–2s per test). Reach for the training-data helpers **only** when your assertions depend on the specific tree structure (paths under `nlp/classification/`, `annotations/test/`, etc.). A test that just modifies, renames, or asserts about `README.md` belongs on `run_readme_remote_repo_test`, not `run_training_data_fully_sync_remote`.
+- Files under `data/test/` exist to serve specific tests. When you delete or rewrite a test, audit whether any fixture file under `data/test/` is now unreferenced and delete the orphan in the same PR. Never add a fixture file speculatively or "for a future test" — add it only when the test that uses it already exists.
+- When a test needs a small directory of placeholder text files, call `test::populate_dir_with_txt_files(dir, prefix, count)` instead of open-coding `util::fs::create_dir_all` + a loop over `write_txt_file_to_path`.
+- Test runs override `OXEN_STREAM_SEGMENT_SIZE` to 128 KiB via `bin/test-rust`, so any file larger than ~128 KiB exercises the streamed-transfer / chunked-download code paths. When writing a test that needs to exercise that path, size the file via `stream_segment_size() + N` (where N is small — anywhere from 1 byte to ~1 MiB), **not** a hardcoded multi-MB value. A 1.1 MiB test file exercises the same chunked-transfer code as a 100 MB production file at a fraction of the cost.
 - When possible, put tests in the higher-level `repositories` module rather than the lower-level, version-specific implementation.
     - e.g., Tests should go in `repositories/commits.rs` rather than `core/v_latest/commits.rs`.
 - Tests create unique temporary directories and clean up automatically
