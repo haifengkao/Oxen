@@ -42,6 +42,16 @@ impl Schema {
         }
     }
 
+    pub fn sort_fields_by_name(&mut self) {
+        self.fields.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.dtype.cmp(&b.dtype))
+                .then_with(|| format!("{:?}", a.metadata).cmp(&format!("{:?}", b.metadata)))
+        });
+        self.hash = Schema::hash_fields(&self.fields);
+    }
+
     pub fn to_polars(&self) -> polars::prelude::Schema {
         let mut schema = polars::prelude::Schema::default();
         for field in self.fields.iter() {

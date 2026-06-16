@@ -84,6 +84,7 @@ pub fn maybe_get_metadata_hash(
 ) -> Result<Option<u128>, OxenError> {
     if let Some(metadata) = oxen_metadata {
         let mut hasher = Xxh3::new();
+        let metadata = canonicalize_metadata_for_hash(metadata);
         let metadata_str = serde_json::to_string(&metadata).unwrap();
         hasher.update(metadata_str.as_bytes());
         Ok(Some(hasher.digest128()))
@@ -94,9 +95,21 @@ pub fn maybe_get_metadata_hash(
 
 pub fn get_metadata_hash(oxen_metadata: &Option<GenericMetadata>) -> Result<u128, OxenError> {
     let mut hasher = Xxh3::new();
-    let metadata_str = serde_json::to_string(&oxen_metadata).unwrap();
+    let metadata = oxen_metadata.as_ref().map(canonicalize_metadata_for_hash);
+    let metadata_str = serde_json::to_string(&metadata).unwrap();
     hasher.update(metadata_str.as_bytes());
     Ok(hasher.digest128())
+}
+
+fn canonicalize_metadata_for_hash(metadata: &GenericMetadata) -> GenericMetadata {
+    match metadata {
+        GenericMetadata::MetadataTabular(tabular_metadata) => {
+            let mut tabular_metadata = tabular_metadata.clone();
+            tabular_metadata.tabular.schema.sort_fields_by_name();
+            GenericMetadata::MetadataTabular(tabular_metadata)
+        }
+        _ => metadata.clone(),
+    }
 }
 
 pub fn u128_hash_file_contents(path: &Path) -> Result<u128, OxenError> {
@@ -211,6 +224,8 @@ impl<R: Read + ?Sized> Read for HashingReader<'_, R> {
 #[cfg(test)]
 mod hashing_reader_tests {
     use super::*;
+    use crate::model::data_frame::schema::{Field, Schema};
+    use crate::model::metadata::MetadataTabular;
 
     #[test]
     fn sync_reader_matches_one_shot() {
@@ -231,5 +246,33 @@ mod hashing_reader_tests {
         hashing.read_to_end(&mut sink).unwrap();
         assert!(sink.is_empty());
         assert_eq!(hashing.digest128(), xxh3_128(b""));
+    }
+
+    #[test]
+    fn tabular_metadata_hash_is_stable_across_field_order() {
+        let metadata_a = Some(GenericMetadata::MetadataTabular(MetadataTabular::new(
+            2,
+            10,
+            Schema::new(vec![Field::new("b", "str"), Field::new("a", "i64")]),
+        )));
+        let metadata_b = Some(GenericMetadata::MetadataTabular(MetadataTabular::new(
+            2,
+            10,
+            Schema::new(vec![Field::new("a", "i64"), Field::new("b", "str")]),
+        )));
+        let metadata_c = Some(GenericMetadata::MetadataTabular(MetadataTabular::new(
+            2,
+            10,
+            Schema::new(vec![Field::new("a", "str"), Field::new("b", "str")]),
+        )));
+
+        assert_eq!(
+            get_metadata_hash(&metadata_a).unwrap(),
+            get_metadata_hash(&metadata_b).unwrap()
+        );
+        assert_ne!(
+            get_metadata_hash(&metadata_a).unwrap(),
+            get_metadata_hash(&metadata_c).unwrap()
+        );
     }
 }

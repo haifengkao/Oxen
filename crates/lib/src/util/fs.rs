@@ -1963,7 +1963,11 @@ pub(crate) fn classify_modified_from_node_with_metadata(
     }
 
     // Mtime drifted but size matches — fall back to metadata hash, then content hash.
-    let node_metadata_hash = node.metadata_hash();
+    let node_metadata_hash = if let Some(node_metadata) = node.metadata() {
+        util::hasher::maybe_get_metadata_hash(&Some(node_metadata))?.map(MerkleHash::new)
+    } else {
+        node.metadata_hash().cloned()
+    };
     let file_metadata_hash = {
         let mime_type = util::fs::file_mime_type(path);
         let data_type = util::fs::datatype_from_mimetype(path, mime_type.as_str());
@@ -1972,9 +1976,9 @@ pub(crate) fn classify_modified_from_node_with_metadata(
         util::hasher::maybe_get_metadata_hash(&file_metadata)?
     };
 
-    if node_metadata_hash.is_some()
-        && file_metadata_hash.is_some()
-        && *node_metadata_hash.unwrap() != MerkleHash::new(file_metadata_hash.unwrap())
+    if let (Some(node_metadata_hash), Some(file_metadata_hash)) =
+        (node_metadata_hash, file_metadata_hash)
+        && node_metadata_hash != MerkleHash::new(file_metadata_hash)
     {
         return Ok(true);
     }
